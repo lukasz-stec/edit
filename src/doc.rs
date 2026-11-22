@@ -33,6 +33,50 @@ pub enum Motion {
     PageDown(usize),
 }
 
+/// A rectangle in *visual* columns, used by Column Selection Mode (IntelliJ Alt+Shift+Insert).
+/// Unlike plain selections it may extend past the end of short lines ("virtual space");
+/// typing there pads the line with spaces.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Block {
+    pub anchor_line: usize,
+    pub anchor_col: usize,
+    pub head_line: usize,
+    pub head_col: usize,
+}
+
+impl Block {
+    pub fn at(line: usize, col: usize) -> Self {
+        Block { anchor_line: line, anchor_col: col, head_line: line, head_col: col }
+    }
+    pub fn lines(&self) -> (usize, usize) {
+        (self.anchor_line.min(self.head_line), self.anchor_line.max(self.head_line))
+    }
+    pub fn cols(&self) -> (usize, usize) {
+        (self.anchor_col.min(self.head_col), self.anchor_col.max(self.head_col))
+    }
+}
+
+/// One selection per line covering visual columns `a_col..h_col` (clamped to each line's end).
+/// Returns the selections and the index of the one on the head line.
+pub fn rect_sels(rope: &Rope, tab: usize, a_line: usize, a_col: usize, h_line: usize, h_col: usize) -> (Vec<Sel>, usize) {
+    let (la, lb) = (a_line.min(h_line), a_line.max(h_line));
+    let sels = (la..=lb)
+        .map(|l| {
+            let ls = rope.line_to_char(l);
+            Sel {
+                anchor: ls + col_from_visual(rope, l, a_col, tab),
+                head: ls + col_from_visual(rope, l, h_col, tab),
+                goal: Some(h_col),
+            }
+        })
+        .collect();
+    (sels, if h_line >= a_line { lb - la } else { 0 })
+}
+
+fn visual_len(rope: &Rope, line: usize, tab: usize) -> usize {
+    visual_col(rope, line, line_len(rope, line), tab)
+}
+
 #[derive(Clone)]
 struct Snapshot {
     rope: Rope,
@@ -88,6 +132,10 @@ pub struct Document {
     expand_stack: Vec<(Vec<Sel>, Vec<Sel>)>,
     occ_whole_word: bool,
     pub camel_humps: bool,
+    /// IntelliJ Column Selection Mode (per tab, not persisted).
+    pub column_mode: bool,
+    /// Active rectangular block; `sels` mirror it (clamped to line ends).
+    pub block: Option<Block>,
 }
 
 fn pair_close(c: char) -> Option<char> {
@@ -136,6 +184,8 @@ impl Document {
             expand_stack: vec![],
             occ_whole_word: false,
             camel_humps: true,
+            column_mode: false,
+            block: None,
         }
     }
 
@@ -246,6 +296,208 @@ impl Document {
         normalize(&mut self.sels, &mut self.primary, self.rope.len_chars());
         self.last_kind = EditKind::Other;
         self.occ_whole_word = false;
+        self.block = None;
+    }
+
+    // ------------------------------------------------------------ column block
+
+    pub fn set_block(&mut self, b: Block) {
+        let last = self.rope.len_lines() - 1;
+        let b = Block { anchor_line: b.anchor_line.min(last), head_line: b.head_line.min(last), ..b };
+        let (sels, p) = rect_sels(&self.rope, self.tab_size, b.anchor_line, b.anchor_col, b.head_line, b.head_col);
+        self.set_sels(sels, p);
+        self.block = Some(b);
+    }
+
+    /// Re-derive selections from the block without breaking the undo group.
+    fn refresh_block_sels(&mut self) {
+        if let Some(b) = self.block {
+            let (sels, p) = rect_sels(&self.rope, self.tab_size, b.anchor_line, b.anchor_col, b.head_line, b.head_col);
+            self.sels = sels;
+            self.primary = p;
+            normalize(&mut self.sels, &mut self.primary, self.rope.len_chars());
+        }
+    }
+
+    /// Block spanning the primary selection (anchor corner to head corner).
+    pub fn block_from_primary(&self) -> Block {
+        let s = self.primary_sel();
+        let tab = self.tab_size;
+        let (al, ac) = pos_to_lc(&self.rope, s.anchor);
+        let (hl, hc) = pos_to_lc(&self.rope, s.head);
+        let hv = s.goal.filter(|_| s.is_empty()).unwrap_or_else(|| visual_col(&self.rope, hl, hc, tab));
+        let av = if s.is_empty() { hv } else { visual_col(&self.rope, al, ac, tab) };
+        Block { anchor_line: al, anchor_col: av, head_line: hl, head_col: hv }
+    }
+
+    pub fn toggle_column_mode(&mut self) {
+        self.column_mode = !self.column_mode;
+        if self.column_mode {
+            if self.sels.len() == 1 {
+                let b = self.block_from_primary();
+                self.set_block(b);
+            }
+        } else {
+            self.block = None;
+        }
+    }
+
+    /// Replace the block's rectangle on every line, padding short lines with spaces.
+    /// `texts` is either one text for all lines or one per line. Leaves a zero-width
+    /// block (carets) right after the inserted text.
+    pub fn block_replace(&mut self, texts: &[String], kind: EditKind) {
+        let Some(b) = self.block else { return };
+        let (l0, l1) = b.lines();
+        let (c0, c1) = b.cols();
+        let tab = self.tab_size;
+        let per_line = texts.len() == l1 - l0 + 1 && texts.len() > 1;
+        let rope = &self.rope;
+        let mut edits = vec![];
+        for (i, l) in (l0..=l1).enumerate() {
+            let t = if per_line { &texts[i] } else { &texts[0] };
+            let ls = rope.line_to_char(l);
+            let len = line_len(rope, l);
+            let vl = visual_len(rope, l, tab);
+            if vl < c0 {
+                if !t.is_empty() {
+                    edits.push(Edit::replace(ls + len, ls + len, format!("{}{t}", " ".repeat(c0 - vl))));
+                }
+            } else {
+                let a = col_from_visual(rope, l, c0, tab);
+                let e = col_from_visual(rope, l, c1, tab).max(a);
+                edits.push(Edit::replace(ls + a, ls + e, t.clone()));
+            }
+        }
+        let w = texts[0].chars().count();
+        let uniform = !per_line || texts.iter().all(|t| t.chars().count() == w);
+        self.apply(kind, edits);
+        if uniform {
+            let nc = c0 + w;
+            self.block = Some(Block { anchor_line: b.anchor_line, anchor_col: nc, head_line: b.head_line, head_col: nc });
+            self.refresh_block_sels();
+        } else {
+            self.block = None;
+        }
+    }
+
+    pub fn block_backspace(&mut self) {
+        let Some(b) = self.block else { return };
+        let (c0, c1) = b.cols();
+        if c0 != c1 {
+            return self.block_replace(&[String::new()], EditKind::Delete);
+        }
+        if c0 == 0 {
+            return;
+        }
+        let (l0, l1) = b.lines();
+        let tab = self.tab_size;
+        let rope = &self.rope;
+        let edits: Vec<Edit> = (l0..=l1)
+            .filter(|&l| visual_len(rope, l, tab) >= c0)
+            .filter_map(|l| {
+                let e = col_from_visual(rope, l, c0, tab);
+                let ls = rope.line_to_char(l);
+                (e > 0).then(|| Edit::replace(ls + e - 1, ls + e, ""))
+            })
+            .collect();
+        self.apply(EditKind::Delete, edits);
+        self.block = Some(Block { anchor_col: c0 - 1, head_col: c0 - 1, ..b });
+        self.refresh_block_sels();
+    }
+
+    pub fn block_delete(&mut self) {
+        let Some(b) = self.block else { return };
+        let (c0, c1) = b.cols();
+        if c0 != c1 {
+            return self.block_replace(&[String::new()], EditKind::Delete);
+        }
+        let (l0, l1) = b.lines();
+        let tab = self.tab_size;
+        let rope = &self.rope;
+        let edits: Vec<Edit> = (l0..=l1)
+            .filter(|&l| visual_len(rope, l, tab) > c0)
+            .map(|l| {
+                let ls = rope.line_to_char(l) + col_from_visual(rope, l, c0, tab);
+                Edit::replace(ls, ls + 1, "")
+            })
+            .collect();
+        self.apply(EditKind::Delete, edits);
+        self.block = Some(b);
+        self.refresh_block_sels();
+    }
+
+    /// Text of the rectangle, one line per row; virtual space is copied as spaces.
+    pub fn block_copy(&self) -> String {
+        let Some(b) = self.block else { return String::new() };
+        let (l0, l1) = b.lines();
+        let (c0, c1) = b.cols();
+        let tab = self.tab_size;
+        (l0..=l1)
+            .map(|l| {
+                let mut s = String::new();
+                let mut v = 0;
+                for ch in self.rope.line(l).chars() {
+                    if ch == '\n' || v >= c1 {
+                        break;
+                    }
+                    let w = if ch == '\t' { tab - v % tab } else { 1 };
+                    if v >= c0 {
+                        if ch == '\t' {
+                            s.extend(std::iter::repeat(' ').take(w.min(c1 - v)));
+                        } else {
+                            s.push(ch);
+                        }
+                    }
+                    v += w;
+                }
+                let have = s.chars().count();
+                s + &" ".repeat((c1 - c0).saturating_sub(have))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Arrow keys in column mode. `extend` (Shift) grows the rectangle from its anchor;
+    /// otherwise the carets move together (collapsing a non-empty block first).
+    pub fn block_move(&mut self, dl: isize, dc: isize, extend: bool) {
+        let b = self.block.unwrap_or_else(|| self.block_from_primary());
+        let nl = self.rope.len_lines() as isize;
+        let mv = |l: usize, d: isize| (l as isize + d).clamp(0, nl - 1) as usize;
+        let mc = |c: usize, d: isize| (c as isize + d).max(0) as usize;
+        let nb = if extend {
+            Block { head_line: mv(b.head_line, dl), head_col: mc(b.head_col, dc), ..b }
+        } else {
+            let (c0, c1) = b.cols();
+            if c0 != c1 && dc != 0 {
+                let c = if dc < 0 { c0 } else { c1 };
+                Block { anchor_col: c, head_col: c, ..b }
+            } else {
+                let (l0, l1) = b.lines();
+                let dl = dl.clamp(-(l0 as isize), nl - 1 - l1 as isize);
+                Block {
+                    anchor_line: mv(b.anchor_line, dl),
+                    head_line: mv(b.head_line, dl),
+                    anchor_col: mc(b.anchor_col, dc),
+                    head_col: mc(b.head_col, dc),
+                }
+            }
+        };
+        self.set_block(nb);
+    }
+
+    /// IntelliJ Alt+Shift+G: a caret at the end of every line touched by a selection.
+    pub fn carets_at_line_ends(&mut self) {
+        let mut out = vec![];
+        for s in &self.sels {
+            if s.is_empty() {
+                out.push(*s);
+                continue;
+            }
+            let (l0, l1) = self.sel_line_range(s);
+            out.extend((l0..=l1).map(|l| Sel::caret(line_end(&self.rope, l))));
+        }
+        let n = out.len();
+        self.set_sels(out, n.saturating_sub(1));
     }
 
     fn checkpoint(&mut self, kind: EditKind) {
@@ -342,6 +594,7 @@ impl Document {
         self.version = s.version;
         self.dirty_line = Some(self.dirty_line.map_or(line, |d| d.min(line)));
         self.last_kind = EditKind::Other;
+        self.block = None;
     }
 
     // ------------------------------------------------------------ movement
@@ -1348,6 +1601,55 @@ mod tests {
         d.shrink_selection();
         d.shrink_selection();
         assert_eq!(ranges(&d), vec![(6, 18)]);
+    }
+
+    #[test]
+    fn column_block_typing_pads_short_lines() {
+        let mut d = doc("abcdef\nab\nabcdef\n", &[(0, 0)]);
+        d.set_block(Block { anchor_line: 0, anchor_col: 4, head_line: 2, head_col: 4 });
+        d.block_replace(&["X".into()], EditKind::Insert);
+        assert_eq!(d.rope.to_string(), "abcdXef\nab  X\nabcdXef\n");
+        assert_eq!(d.block.unwrap().cols(), (5, 5));
+        d.block_backspace();
+        assert_eq!(d.rope.to_string(), "abcdef\nab  \nabcdef\n");
+        d.undo(); // undo backspace
+        assert_eq!(d.rope.to_string(), "abcdXef\nab  X\nabcdXef\n");
+        d.undo(); // undo typing, including the padding
+        assert_eq!(d.rope.to_string(), "abcdef\nab\nabcdef\n");
+    }
+
+    #[test]
+    fn column_block_copy_and_per_line_paste() {
+        let mut d = doc("abcdef\nab\nabcdef", &[(0, 0)]);
+        d.set_block(Block { anchor_line: 0, anchor_col: 1, head_line: 2, head_col: 4 });
+        assert_eq!(d.block_copy(), "bcd\nb  \nbcd");
+        d.block_replace(&["1".into(), "2".into(), "3".into()], EditKind::Other);
+        assert_eq!(d.rope.to_string(), "a1ef\na2\na3ef");
+    }
+
+    #[test]
+    fn line_end_carets_and_block_move() {
+        let mut d = doc("ab\nabcd\nx", &[(0, 6)]);
+        d.carets_at_line_ends();
+        assert_eq!(ranges(&d), vec![(2, 2), (7, 7)]);
+        let mut d = doc("abc\nabc\nabc", &[(1, 1)]);
+        d.toggle_column_mode();
+        d.block_move(1, 0, true);
+        d.block_move(0, 1, true);
+        assert_eq!(ranges(&d), vec![(1, 2), (5, 6)]);
+        d.block_move(0, 5, true); // into virtual space past the line end
+        assert_eq!(d.block.unwrap().head_col, 7);
+        d.block_replace(&["Z".into()], EditKind::Insert);
+        assert_eq!(d.rope.to_string(), "aZ\naZ\nabc");
+    }
+
+    #[test]
+    fn rectangle_selection_clamps_short_lines() {
+        let r = Rope::from_str("abcdef\nab\nabcdef");
+        let (s, p) = rect_sels(&r, 4, 0, 1, 2, 4);
+        let v: Vec<(usize, usize)> = s.iter().map(|s| (s.anchor, s.head)).collect();
+        assert_eq!(v, vec![(1, 4), (8, 9), (11, 14)]);
+        assert_eq!(p, 2);
     }
 
     #[test]

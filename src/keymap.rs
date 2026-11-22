@@ -33,6 +33,7 @@ pub enum Cmd {
     ToggleCamelHumps,
     ToggleIndentation,
     ToggleLineEndings,
+    ToggleColumnMode,
     Quit,
     // ---- editor
     Undo,
@@ -47,6 +48,7 @@ pub enum Cmd {
     SplitIntoLines,
     AddCaretAbove,
     AddCaretBelow,
+    CaretsAtLineEnds,
     Escape,
     Duplicate,
     DeleteLine,
@@ -77,7 +79,7 @@ impl Cmd {
             NewFile | OpenFile | OpenFolder | Save | SaveAs | SaveAll | CloseTab | NextTab | PrevTab
                 | CommandPalette | GotoAnything | GotoLine | Find | Replace | FindNext | FindPrev
                 | ToggleSidebar | ToggleMinimap | SelectTheme | SetSyntax | PasteFromHistory | ZoomIn
-                | ZoomOut | ZoomReset | ToggleCamelHumps | ToggleIndentation | ToggleLineEndings | Quit
+                | ZoomOut | ZoomReset | ToggleCamelHumps | ToggleIndentation | ToggleLineEndings | ToggleColumnMode | Quit
         )
     }
 
@@ -111,6 +113,7 @@ impl Cmd {
             ToggleCamelHumps => "Preferences: Toggle CamelHumps Word Movement",
             ToggleIndentation => "Indentation: Toggle Tabs / Spaces",
             ToggleLineEndings => "Line Endings: Toggle LF / CRLF",
+            ToggleColumnMode => "Selection: Column Selection Mode (IntelliJ)",
             Quit => "Quit",
             Undo => "Edit: Undo",
             Redo => "Edit: Redo",
@@ -124,6 +127,7 @@ impl Cmd {
             SplitIntoLines => "Selection: Split into Lines",
             AddCaretAbove => "Selection: Add Caret Above",
             AddCaretBelow => "Selection: Add Caret Below",
+            CaretsAtLineEnds => "Selection: Add Carets to Ends of Selected Lines",
             Escape => "Selection: Single Selection",
             Duplicate => "Edit: Duplicate Line / Selection",
             DeleteLine => "Edit: Delete Line",
@@ -151,7 +155,7 @@ impl Cmd {
             ZoomIn, ZoomOut, ZoomReset, ToggleCamelHumps, ToggleIndentation, ToggleLineEndings,
             Undo, Redo, SelectAll, SelectLine, ExpandSelection, ShrinkSelection,
             SelectNextOccurrence, UnselectOccurrence, SelectAllOccurrences, SplitIntoLines,
-            AddCaretAbove, AddCaretBelow, Duplicate, DeleteLine, MoveLineUp, MoveLineDown,
+            AddCaretAbove, AddCaretBelow, CaretsAtLineEnds, ToggleColumnMode, Duplicate, DeleteLine, MoveLineUp, MoveLineDown,
             ToggleComment, Indent, Outdent, JoinLines, SortLines, ToggleCase, InsertLineBelow,
             InsertLineAbove, GotoBracket, NextTab, PrevTab, Quit,
         ]
@@ -211,6 +215,8 @@ const BINDINGS: &[B] = &[
     B(Cmd::SplitIntoLines, C | S, Key::L),
     B(Cmd::AddCaretAbove, C | A, Key::ArrowUp),
     B(Cmd::AddCaretBelow, C | A, Key::ArrowDown),
+    B(Cmd::ToggleColumnMode, A | S, Key::Insert),  // IntelliJ
+    B(Cmd::CaretsAtLineEnds, A | S, Key::G),       // IntelliJ
     B(Cmd::Escape, 0, Key::Escape),
     B(Cmd::Duplicate, C | S, Key::D),
     B(Cmd::DeleteLine, C | S, Key::K),

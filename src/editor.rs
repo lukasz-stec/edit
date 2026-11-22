@@ -1,12 +1,12 @@
 //! The editor widget: custom painting of text, carets, selections, gutter, minimap.
 
-use crate::doc::Document;
+use crate::doc::{rect_sels, Block, Document};
 use crate::highlight::{Colors, LineCache, Syntax};
 use crate::selection::Sel;
 use crate::text::*;
 use eframe::egui::{
-    self, pos2, text::LayoutJob, vec2, Align2, Color32, EventFilter, FontId, Id, Pos2, Rect,
-    Response, Sense, Stroke, TextFormat, Ui, Vec2,
+    self, pos2, text::LayoutJob, vec2, Align2, Color32, EventFilter, FontId, Id, PointerButton,
+    Pos2, Rect, Response, Sense, Stroke, TextFormat, Ui, Vec2,
 };
 use std::time::Duration;
 use syntect::highlighting::Theme;
@@ -16,12 +16,23 @@ enum DragMode {
     Char,
     Word,
     Line,
+    /// Rectangular selection clamped to line ends (Alt+drag, middle drag).
     Column { line: usize, vcol: usize },
+    /// Column Selection Mode: rectangle with virtual space.
+    Block,
 }
 
 struct Drag {
     mode: DragMode,
     origin: Sel,
+    /// Selections kept while dragging (Ctrl+Alt+Shift+drag adds another rectangle).
+    base: Vec<Sel>,
+}
+
+impl Drag {
+    fn new(mode: DragMode, origin: Sel) -> Self {
+        Drag { mode, origin, base: vec![] }
+    }
 }
 
 pub struct View {
@@ -132,14 +143,31 @@ pub fn show(ui: &mut Ui, doc: &mut Document, view: &mut View, cx: &Ctx) -> Respo
     // ------------------------------------------------------------ input: mouse press
     let over_editor = pointer.is_some_and(|p| rect.contains(p))
         && ui.ctx().layer_id_at(pointer.unwrap()).is_some_and(|l| l == ui.layer_id());
-    if pressed && over_editor {
+    let mid_pressed = ui.input(|i| i.pointer.button_pressed(PointerButton::Middle));
+    if (pressed || mid_pressed) && over_editor {
         let p = pointer.unwrap();
         resp.request_focus();
-        if mm_w > 0.0 && mm_rect.contains(p) {
+        let ctrl = mods.ctrl || mods.command;
+        if pressed && mm_w > 0.0 && mm_rect.contains(p) {
             view.mm_drag = true;
-        } else if sb_rect.contains(p) {
+        } else if pressed && sb_rect.contains(p) {
             let (ty, th) = thumb(sb_rect, view.scroll.y, max_scroll_y, vis_h);
             view.sb_drag = Some(if p.y >= ty && p.y <= ty + th { p.y - ty } else { th / 2.0 });
+        } else if mid_pressed {
+            let (pos, line, vcol) = pos_at(p, doc, view.scroll);
+            if mods.alt && mods.shift {
+                // IntelliJ: Alt+Shift+Middle-Click selects the rectangle from the caret to here
+                let s = doc.primary_sel();
+                let (hl, hc) = pos_to_lc(&doc.rope, s.head);
+                let hv = visual_col(&doc.rope, hl, hc, tab);
+                let (sels, pr) = rect_sels(&doc.rope, tab, hl, hv, line, vcol);
+                doc.set_sels(sels, pr);
+                view.drag = None;
+            } else {
+                // Sublime: middle-button drag selects a rectangle
+                doc.set_sels(vec![Sel::caret(pos)], 0);
+                view.drag = Some(Drag::new(DragMode::Column { line, vcol }, Sel::caret(pos)));
+            }
         } else {
             let (pos, line, vcol) = pos_at(p, doc, view.scroll);
             let count = match view.last_click {
@@ -148,24 +176,9 @@ pub fn show(ui: &mut Ui, doc: &mut Document, view: &mut View, cx: &Ctx) -> Respo
             };
             view.last_click = Some((time, pos, count));
             let rope = &doc.rope;
-            if gutter.contains(p) {
-                let a = rope.line_to_char(line);
-                let b = if line + 1 < nlines { rope.line_to_char(line + 1) } else { rope.len_chars() };
-                let s = Sel::new(a, b);
-                doc.set_sels(vec![s], 0);
-                view.drag = Some(Drag { mode: DragMode::Line, origin: s });
-            } else if mods.alt && mods.shift {
-                // IntelliJ: Alt+Shift+Click adds a caret
-                doc.add_caret_at(pos);
-                view.drag = None;
-            } else if mods.alt || ui.input(|i| i.pointer.middle_down()) {
-                // Column (box) selection: Alt+drag (IntelliJ) / middle drag (Sublime)
-                doc.set_sels(vec![Sel::caret(pos)], 0);
-                view.drag = Some(Drag { mode: DragMode::Column { line, vcol }, origin: Sel::caret(pos) });
-            } else if mods.ctrl || mods.command {
-                // Sublime: Ctrl+Click adds a caret
+            let add_word_or_caret = |doc: &mut Document| {
                 if count == 2 {
-                    let r = double_click_range(rope, pos);
+                    let r = double_click_range(&doc.rope, pos);
                     let mut sels = doc.sels.clone();
                     sels.retain(|s| !(s.is_empty() && s.head == pos));
                     sels.push(Sel::new(r.start, r.end));
@@ -174,13 +187,53 @@ pub fn show(ui: &mut Ui, doc: &mut Document, view: &mut View, cx: &Ctx) -> Respo
                 } else {
                     doc.add_caret_at(pos);
                 }
-                view.drag = Some(Drag { mode: DragMode::Char, origin: doc.primary_sel() });
+            };
+            if gutter.contains(p) {
+                let a = rope.line_to_char(line);
+                let b = if line + 1 < nlines { rope.line_to_char(line + 1) } else { rope.len_chars() };
+                let s = Sel::new(a, b);
+                doc.set_sels(vec![s], 0);
+                view.drag = Some(Drag::new(DragMode::Line, s));
+            } else if doc.column_mode && !ctrl && !mods.alt {
+                // Column Selection Mode: click/drag places carets anywhere, even past line end
+                let b = if mods.shift {
+                    let mut b = doc.block.unwrap_or_else(|| doc.block_from_primary());
+                    b.head_line = line;
+                    b.head_col = vcol;
+                    b
+                } else {
+                    Block::at(line, vcol)
+                };
+                doc.set_block(b);
+                view.drag = Some(Drag::new(DragMode::Block, doc.primary_sel()));
+            } else if ctrl && mods.alt && mods.shift {
+                // IntelliJ: Ctrl+Alt+Shift+drag adds another rectangular fragment
+                let base = doc.sels.clone();
+                let mut sels = base.clone();
+                sels.push(Sel::caret(pos));
+                let n = sels.len() - 1;
+                doc.set_sels(sels, n);
+                view.drag = Some(Drag { mode: DragMode::Column { line, vcol }, origin: Sel::caret(pos), base });
+            } else if mods.alt && mods.shift {
+                // IntelliJ: Alt+Shift+Click adds/removes a caret, +drag adds a selection,
+                // +double-click adds a word
+                let before = doc.sels.len();
+                add_word_or_caret(doc);
+                view.drag = (doc.sels.len() >= before).then(|| Drag::new(DragMode::Char, doc.primary_sel()));
+            } else if mods.alt {
+                // IntelliJ: Alt+drag selects a rectangle
+                doc.set_sels(vec![Sel::caret(pos)], 0);
+                view.drag = Some(Drag::new(DragMode::Column { line, vcol }, Sel::caret(pos)));
+            } else if ctrl {
+                // Sublime: Ctrl+Click adds a caret, Ctrl+double-click adds a word
+                add_word_or_caret(doc);
+                view.drag = Some(Drag::new(DragMode::Char, doc.primary_sel()));
             } else if mods.shift {
                 let mut s = doc.primary_sel();
                 s.head = pos;
                 s.goal = None;
                 doc.set_sels(vec![s], 0);
-                view.drag = Some(Drag { mode: DragMode::Char, origin: s });
+                view.drag = Some(Drag::new(DragMode::Char, s));
             } else {
                 let (s, mode) = match count {
                     2 => {
@@ -195,7 +248,7 @@ pub fn show(ui: &mut Ui, doc: &mut Document, view: &mut View, cx: &Ctx) -> Respo
                     _ => (Sel::caret(pos), DragMode::Char),
                 };
                 doc.set_sels(vec![s], 0);
-                view.drag = Some(Drag { mode, origin: s });
+                view.drag = Some(Drag::new(mode, s));
             }
         }
     }
@@ -241,17 +294,17 @@ pub fn show(ui: &mut Ui, doc: &mut Document, view: &mut View, cx: &Ctx) -> Respo
                     doc.set_sels(vec![s], 0);
                 }
                 DragMode::Column { line: l0, vcol: v0 } => {
-                    let (la, lb) = (l0.min(line), l0.max(line));
-                    let sels: Vec<Sel> = (la..=lb)
-                        .map(|l| {
-                            let ls = rope.line_to_char(l);
-                            let a = col_from_visual(rope, l, v0, tab);
-                            let h = col_from_visual(rope, l, vcol, tab);
-                            Sel { anchor: ls + a, head: ls + h, goal: Some(vcol) }
-                        })
-                        .collect();
-                    let n = if line >= l0 { sels.len() - 1 } else { 0 };
+                    let (rect, pr) = rect_sels(rope, tab, l0, v0, line, vcol);
+                    let mut sels = drag.base.clone();
+                    let n = sels.len() + pr;
+                    sels.extend(rect);
                     doc.set_sels(sels, n);
+                }
+                DragMode::Block => {
+                    let mut b = doc.block.unwrap_or(Block::at(line, vcol));
+                    b.head_line = line;
+                    b.head_col = vcol;
+                    doc.set_block(b);
                 }
             }
             ui.ctx().request_repaint();
@@ -284,7 +337,7 @@ pub fn show(ui: &mut Ui, doc: &mut Document, view: &mut View, cx: &Ctx) -> Respo
     // ------------------------------------------------------------ scroll to caret
     let ph = doc.primary_sel().head;
     let (pl, pc) = pos_to_lc(&doc.rope, ph);
-    let pvc = visual_col(&doc.rope, pl, pc, tab);
+    let pvc = doc.block.map_or_else(|| visual_col(&doc.rope, pl, pc, tab), |b| b.head_col);
     if view.center_caret {
         view.center_caret = false;
         view.scroll_to_caret = false;
@@ -371,7 +424,17 @@ pub fn show(ui: &mut Ui, doc: &mut Document, view: &mut View, cx: &Ctx) -> Respo
             }
         }
     };
-    for s in &doc.sels {
+    if let Some(b) = doc.block {
+        let (l0, l1) = b.lines();
+        let (c0, c1) = b.cols();
+        if c1 > c0 {
+            for l in l0.max(first)..=l1.min(last.saturating_sub(1)) {
+                let r = Rect::from_min_max(pos2(x_of(c0), y_of(l)), pos2(x_of(c1), y_of(l) + lh));
+                tp.rect_filled(r, 0.0, c.selection);
+            }
+        }
+    }
+    for s in doc.sels.iter().filter(|_| doc.block.is_none()) {
         if !s.is_empty() && s.end() >= first_char && s.start() <= last_char {
             range_rects(s.start(), s.end(), &mut |r| { tp.rect_filled(r, 2.0, c.selection); });
         }
@@ -529,14 +592,23 @@ pub fn show(ui: &mut Ui, doc: &mut Document, view: &mut View, cx: &Ctx) -> Respo
     }
     if blink_on {
         let caret_col = if focused { c.caret } else { c.caret.gamma_multiply(0.35) };
-        for s in &doc.sels {
-            if s.head < first_char || s.head > last_char {
-                continue;
+        let caret = |l: usize, v: usize| {
+            tp.rect_filled(Rect::from_min_size(pos2(x_of(v) - 1.0, y_of(l) + 1.0), vec2(2.0, lh - 2.0)), 0.0, caret_col);
+        };
+        if let Some(b) = doc.block {
+            // carets sit at the block column on every line, even in virtual space
+            let (l0, l1) = b.lines();
+            for l in l0.max(first)..=l1.min(last.saturating_sub(1)) {
+                caret(l, b.head_col);
             }
-            let (l, col) = pos_to_lc(rope, s.head);
-            let v = visual_col(rope, l, col, tab);
-            let x = x_of(v);
-            tp.rect_filled(Rect::from_min_size(pos2(x - 1.0, y_of(l) + 1.0), vec2(2.0, lh - 2.0)), 0.0, caret_col);
+        } else {
+            for s in &doc.sels {
+                if s.head < first_char || s.head > last_char {
+                    continue;
+                }
+                let (l, col) = pos_to_lc(rope, s.head);
+                caret(l, visual_col(rope, l, col, tab));
+            }
         }
     }
 

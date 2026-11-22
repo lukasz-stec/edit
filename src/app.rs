@@ -1,11 +1,12 @@
 //! Application shell: tabs, sidebar, command palette, find bar, dialogs.
 
-use crate::doc::{Document, Motion};
+use crate::doc::{Document, EditKind, Motion};
 use crate::editor::{self, Settings, View};
 use crate::highlight::{config_dir, lerp, Colors, LineCache, Syntax};
 use crate::keymap::{self, Cmd};
 use crate::search;
 use crate::selection::Sel;
+use crate::session::{FileState, Session};
 use crate::text::line_text;
 use eframe::egui::{
     self, text::LayoutJob, vec2, Align2, Color32, Event, FontData, FontDefinitions, FontFamily,
@@ -105,6 +106,14 @@ pub struct App {
     status: Option<(String, f64)>,
     camel_humps: bool,
     to_open: Option<PathBuf>,
+    /// Last session text written to disk, and when.
+    session_text: String,
+    session_saved_at: f64,
+    /// Focus the editor once it exists (egui drops focus requests for unseen widgets).
+    startup_focus: bool,
+    ctrl_prev: bool,
+    ctrl_last_press: f64,
+    double_ctrl: bool,
 }
 
 impl App {
@@ -142,16 +151,106 @@ impl App {
             status: None,
             camel_humps: true,
             to_open: None,
+            session_text: String::new(),
+            session_saved_at: 0.0,
+            startup_focus: false,
+            ctrl_prev: false,
+            ctrl_last_press: -1.0,
+            double_ctrl: false,
         };
+        let session = Session::load();
+        let had_session = session.is_some();
+        if let Some(s) = session {
+            app.restore(s);
+        }
         app.apply_visuals(&cc.egui_ctx);
         for a in args {
             app.open_path(&a);
         }
-        if app.root.is_none() && app.tabs.iter().all(|t| t.doc.path.is_none()) {
+        if !had_session && app.root.is_none() && app.tabs.iter().all(|t| t.doc.path.is_none()) {
             app.sidebar = false;
         }
-        cc.egui_ctx.memory_mut(|m| m.request_focus(app.editor_id));
+        app.startup_focus = true;
         app
+    }
+
+    // ------------------------------------------------------------ session
+
+    fn restore(&mut self, s: Session) {
+        if let Some(t) = s.theme.filter(|t| self.syn.themes.themes.contains_key(t)) {
+            self.theme_name = t;
+        }
+        if let Some(f) = s.font_size {
+            self.settings.font_size = f.clamp(6.0, 48.0);
+        }
+        if let Some(m) = s.minimap {
+            self.settings.minimap = m;
+        }
+        if let Some(c) = s.camel_humps {
+            self.camel_humps = c;
+        }
+        if let Some(r) = s.root.filter(|r| r.is_dir()) {
+            self.set_root(r);
+        }
+        for f in &s.files {
+            if !f.path.is_file() {
+                continue; // deleted or moved since last run
+            }
+            self.open_path(&f.path);
+            let t = self.cur();
+            if t.doc.path.as_deref() == Some(f.path.as_path()) {
+                t.doc.set_sels(vec![Sel::new(f.anchor, f.head)], 0);
+                t.view.scroll.y = f.scroll_y;
+            }
+        }
+        if let Some(p) = s.files.get(s.active).map(|f| &f.path) {
+            if let Some(i) = self.tabs.iter().position(|t| t.doc.path.as_deref() == Some(p.as_path())) {
+                self.active = i;
+            }
+        }
+        if let Some(b) = s.sidebar {
+            self.sidebar = b;
+        }
+    }
+
+    fn session(&self) -> Session {
+        let with_path = |t: &Tab| t.doc.path.is_some();
+        Session {
+            root: self.root.clone(),
+            files: self
+                .tabs
+                .iter()
+                .filter_map(|t| {
+                    let s = t.doc.primary_sel();
+                    Some(FileState { path: t.doc.path.clone()?, anchor: s.anchor, head: s.head, scroll_y: t.view.scroll.y })
+                })
+                .collect(),
+            active: self.tabs[..self.active].iter().filter(|t| with_path(t)).count(),
+            theme: Some(self.theme_name.clone()),
+            font_size: Some(self.settings.font_size),
+            sidebar: Some(self.sidebar),
+            minimap: Some(self.settings.minimap),
+            camel_humps: Some(self.camel_humps),
+        }
+    }
+
+    /// Save the session when it changed: throttled to every 2s, immediately when `force`.
+    fn persist_session(&mut self, ctx: &egui::Context, force: bool) {
+        let text = self.session().to_text();
+        if text == self.session_text {
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        let since = now - self.session_saved_at;
+        if !force && since < 2.0 {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(2.05 - since));
+            return;
+        }
+        if let Err(e) = Session::save_text(&text) {
+            self.set_status(ctx, format!("Could not save session: {e}"));
+        }
+        self.session_text = text;
+        self.session_saved_at = now;
     }
 
     fn apply_visuals(&mut self, ctx: &egui::Context) {
@@ -279,7 +378,89 @@ impl App {
 
     // ------------------------------------------------------------ commands
 
+    fn store_clip(&mut self, ctx: &egui::Context, text: String, line: bool) {
+        if text.is_empty() {
+            return;
+        }
+        ctx.output_mut(|o| o.copied_text = text.clone());
+        self.line_clip = line.then(|| text.clone());
+        self.clip_history.retain(|h| h != &text);
+        self.clip_history.insert(0, text);
+        self.clip_history.truncate(30);
+    }
+
+    /// Column Selection Mode: route edits to the rectangular block. Returns true if handled.
+    fn block_action(&mut self, ctx: &egui::Context, a: &Action) -> bool {
+        let doc = &mut self.tabs[self.active].doc;
+        if doc.block.is_none() {
+            // In column mode, Shift+arrows start a block at the caret.
+            let starts = doc.column_mode
+                && doc.sels.len() == 1
+                && matches!(a, Action::Cmd(Cmd::Move(Motion::Left | Motion::Right | Motion::Up | Motion::Down, true)));
+            if !starts {
+                return false;
+            }
+            let b = doc.block_from_primary();
+            doc.set_block(b);
+        }
+        let b = doc.block.unwrap();
+        let (l0, l1) = b.lines();
+        match a {
+            Action::Text(t) if !t.contains('\n') => doc.block_replace(&[t.clone()], EditKind::Insert),
+            Action::Paste(t) => {
+                let t = t.replace("\r\n", "\n");
+                let parts: Vec<String> = t.strip_suffix('\n').unwrap_or(&t).split('\n').map(String::from).collect();
+                if parts.len() != 1 && parts.len() != l1 - l0 + 1 {
+                    doc.block = None;
+                    return false;
+                }
+                doc.block_replace(&parts, EditKind::Other);
+            }
+            Action::Copy | Action::Cut => {
+                let text = doc.block_copy();
+                if matches!(a, Action::Cut) {
+                    doc.block_replace(&[String::new()], EditKind::Delete);
+                }
+                self.store_clip(ctx, text, false);
+            }
+            Action::Cmd(Cmd::Backspace(_)) => doc.block_backspace(),
+            Action::Cmd(Cmd::DeleteFwd(_)) => doc.block_delete(),
+            Action::Cmd(Cmd::Tab) => {
+                let n = doc.tab_size - b.cols().0 % doc.tab_size;
+                doc.block_replace(&[" ".repeat(n)], EditKind::Insert);
+            }
+            Action::Cmd(Cmd::Move(m, ext)) => {
+                let (dl, dc) = match m {
+                    Motion::Left => (0, -1),
+                    Motion::Right => (0, 1),
+                    Motion::Up => (-1, 0),
+                    Motion::Down => (1, 0),
+                    _ => {
+                        doc.block = None;
+                        return false;
+                    }
+                };
+                doc.block_move(dl, dc, *ext);
+            }
+            Action::Cmd(Cmd::Escape) => {
+                let h = doc.primary_sel().head;
+                doc.set_sels(vec![Sel::caret(h)], 0);
+            }
+            Action::Cmd(c) if c.is_global() => return false,
+            _ => {
+                // Any other command works on the (clamped) per-line selections.
+                doc.block = None;
+                return false;
+            }
+        }
+        self.cur().view.scroll_to_caret = true;
+        true
+    }
+
     fn run(&mut self, ctx: &egui::Context, a: Action) {
+        if self.block_action(ctx, &a) {
+            return;
+        }
         let page = self.tabs[self.active].view.page_lines;
         match a {
             Action::Text(t) => self.cur().doc.type_text(&t),
@@ -290,13 +471,7 @@ impl App {
             }
             Action::Copy | Action::Cut => {
                 let (text, line) = if matches!(a, Action::Cut) { self.cur().doc.cut() } else { self.cur().doc.copy() };
-                if !text.is_empty() {
-                    ctx.output_mut(|o| o.copied_text = text.clone());
-                    self.line_clip = line.then(|| text.clone());
-                    self.clip_history.retain(|h| h != &text);
-                    self.clip_history.insert(0, text);
-                    self.clip_history.truncate(30);
-                }
+                self.store_clip(ctx, text, line);
             }
             Action::Cmd(cmd) => {
                 if cmd.is_global() {
@@ -321,6 +496,7 @@ impl App {
                     SplitIntoLines => doc.split_into_lines(),
                     AddCaretAbove => doc.add_caret(true),
                     AddCaretBelow => doc.add_caret(false),
+                    CaretsAtLineEnds => doc.carets_at_line_ends(),
                     Escape => doc.single_selection(),
                     Duplicate => doc.duplicate(),
                     DeleteLine => doc.delete_lines(),
@@ -423,6 +599,12 @@ impl App {
                 let d = &mut self.tabs[self.active].doc;
                 d.use_tabs = !d.use_tabs;
             }
+            ToggleColumnMode => {
+                let t = &mut self.tabs[self.active];
+                t.doc.toggle_column_mode();
+                let on = t.doc.column_mode;
+                self.set_status(ctx, format!("Column selection mode {}", if on { "ON" } else { "OFF" }));
+            }
             ToggleLineEndings => {
                 let d = &mut self.tabs[self.active].doc;
                 d.crlf = !d.crlf;
@@ -441,9 +623,25 @@ impl App {
         let mut keep = Vec::with_capacity(events.len());
         let mut actions = vec![];
         let mut suppress_text = false;
+        // IntelliJ "clone caret": press Ctrl twice, keep it held, then Up/Down.
+        // egui repaints on every modifier change, so sampling per frame sees each press.
+        let (mods, now) = ctx.input(|i| (i.modifiers, i.time));
+        if mods.ctrl && !self.ctrl_prev {
+            self.double_ctrl = !mods.shift && !mods.alt && now - self.ctrl_last_press < 0.4;
+            self.ctrl_last_press = now;
+        }
+        if !mods.ctrl {
+            self.double_ctrl = false;
+        }
+        self.ctrl_prev = mods.ctrl;
         for ev in events {
             let ed = editor_focused && !modal;
             match &ev {
+                Event::Key { key: k @ (Key::ArrowUp | Key::ArrowDown), pressed: true, modifiers, .. }
+                    if ed && self.double_ctrl && modifiers.ctrl && !modifiers.shift && !modifiers.alt =>
+                {
+                    actions.push(Action::Cmd(if *k == Key::ArrowUp { Cmd::AddCaretAbove } else { Cmd::AddCaretBelow }));
+                }
                 Event::Key { key, pressed: true, modifiers, .. } => {
                     if let Some(cmd) = keymap::lookup(*key, *modifiers) {
                         if (cmd.is_global() && self.pending.is_none()) || ed {
@@ -461,6 +659,14 @@ impl App {
                     suppress_text = false;
                 }
                 Event::Ime(ImeEvent::Commit(t)) if ed => actions.push(Action::Text(t.clone())),
+                // egui-winit turns Shift+Insert into a Paste event and swallows the key, so
+                // IntelliJ's Alt+Shift+Insert (column mode) arrives as Paste with Alt held.
+                Event::Paste(_) if mods.alt && mods.shift => {
+                    if self.pending.is_none() {
+                        actions.push(Action::Cmd(Cmd::ToggleColumnMode));
+                    }
+                }
+                Event::Paste(_) | Event::Copy | Event::Cut if mods.alt => {}
                 Event::Paste(t) if ed => actions.push(Action::Paste(t.clone())),
                 Event::Copy if ed => actions.push(Action::Copy),
                 Event::Cut if ed => actions.push(Action::Cut),
@@ -975,12 +1181,13 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.input(|i| i.viewport().close_requested())
-            && !self.allow_quit
-            && self.tabs.iter().any(|t| t.doc.is_dirty())
-        {
-            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            self.pending = Some(Pending::Quit);
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if !self.allow_quit && self.tabs.iter().any(|t| t.doc.is_dirty()) {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                self.pending = Some(Pending::Quit);
+            } else {
+                self.persist_session(ctx, true);
+            }
         }
 
         self.handle_input(ctx);
@@ -1009,7 +1216,7 @@ impl eframe::App for App {
                     }
                 });
                 ui.menu_button("Selection", |ui| {
-                    for cmd in [Cmd::SelectAll, Cmd::SelectLine, Cmd::ExpandSelection, Cmd::ShrinkSelection, Cmd::SelectNextOccurrence, Cmd::UnselectOccurrence, Cmd::SelectAllOccurrences, Cmd::SplitIntoLines, Cmd::AddCaretAbove, Cmd::AddCaretBelow] {
+                    for cmd in [Cmd::SelectAll, Cmd::SelectLine, Cmd::ExpandSelection, Cmd::ShrinkSelection, Cmd::SelectNextOccurrence, Cmd::UnselectOccurrence, Cmd::SelectAllOccurrences, Cmd::SplitIntoLines, Cmd::AddCaretAbove, Cmd::AddCaretBelow, Cmd::CaretsAtLineEnds, Cmd::ToggleColumnMode] {
                         item(ui, cmd, self);
                     }
                 });
@@ -1059,6 +1266,11 @@ impl eframe::App for App {
                     ui.separator();
                     ui.label(RichText::new(if d.use_tabs { format!("Tab Size: {}", d.tab_size) } else { format!("Spaces: {}", d.tab_size) }).small());
                     ui.separator();
+                    if d.column_mode {
+                        ui.label(RichText::new("Column").small().strong())
+                            .on_hover_text("Column selection mode (Alt+Shift+Insert)");
+                        ui.separator();
+                    }
                     ui.label(RichText::new(if self.camel_humps { "CamelHumps" } else { "Words" }).small())
                         .on_hover_text("Ctrl+Left/Right word movement mode (toggle in View menu)");
                 });
@@ -1162,7 +1374,10 @@ impl eframe::App for App {
             let find: &[(usize, usize)] = if self.find.open { &self.find.matches } else { &[] };
             let cx = editor::Ctx { syn: &self.syn, theme, colors: &self.colors, settings: &self.settings, find, id: self.editor_id };
             let tab = &mut self.tabs[self.active];
-            editor::show(ui, &mut tab.doc, &mut tab.view, &cx);
+            let resp = editor::show(ui, &mut tab.doc, &mut tab.view, &cx);
+            if std::mem::take(&mut self.startup_focus) {
+                resp.request_focus();
+            }
         });
 
         self.palette_ui(ctx);
@@ -1180,6 +1395,7 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(ViewportCommand::Title(title.clone()));
             self.title = title;
         }
+        self.persist_session(ctx, false);
     }
 }
 

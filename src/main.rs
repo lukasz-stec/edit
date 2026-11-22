@@ -7,6 +7,7 @@ mod highlight;
 mod keymap;
 mod search;
 mod selection;
+mod session;
 mod text;
 
 use eframe::egui;
