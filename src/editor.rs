@@ -392,10 +392,18 @@ pub fn show(ui: &mut Ui, doc: &mut Document, view: &mut View, cx: &Ctx) -> Respo
         .map(|s| rope.char_to_line(s.head))
         .collect();
     caret_lines.dedup();
-    for &l in &caret_lines {
-        if doc.sels.len() == 1 && !doc.sels[0].is_empty() {
-            break;
-        }
+    // Current-line highlight only for carets without a selection (like IntelliJ); otherwise
+    // it paints every line of a rectangular selection full-width and hides the selection.
+    let any_selection =
+        doc.block.is_some_and(|b| b.cols().0 != b.cols().1) || doc.sels.iter().any(|s| !s.is_empty());
+    let mut hl_lines: Vec<usize> = doc
+        .sels
+        .iter()
+        .filter(|s| !any_selection && s.head >= first_char && s.head <= last_char)
+        .map(|s| rope.char_to_line(s.head))
+        .collect();
+    hl_lines.dedup();
+    for &l in &hl_lines {
         tp.rect_filled(Rect::from_min_size(pos2(text_rect.left(), y_of(l)), vec2(text_rect.width(), lh)), 0.0, c.line_hl);
     }
 
