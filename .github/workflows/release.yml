@@ -74,7 +74,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           cargo build --release
-          tar -czf "${{ matrix.asset }}" -C target/release edit
+          cp assets/icon.png target/release/edit.png
+          tar -czf "${{ matrix.asset }}" -C target/release edit edit.png
 
       - name: Build (macOS universal .app)
         if: runner.os == 'macOS'
@@ -82,7 +83,8 @@ jobs:
           cargo build --release --target aarch64-apple-darwin
           cargo build --release --target x86_64-apple-darwin
           app=Edit.app/Contents
-          mkdir -p "$app/MacOS"
+          mkdir -p "$app/MacOS" "$app/Resources"
+          cp assets/icon.icns "$app/Resources/edit.icns"
           lipo -create -output "$app/MacOS/edit" \
             target/aarch64-apple-darwin/release/edit target/x86_64-apple-darwin/release/edit
           cat > "$app/Info.plist" <<EOF
@@ -93,6 +95,7 @@ jobs:
             <key>CFBundleDisplayName</key><string>Edit</string>
             <key>CFBundleIdentifier</key><string>io.github.edit.editor</string>
             <key>CFBundleExecutable</key><string>edit</string>
+            <key>CFBundleIconFile</key><string>edit</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>${EDIT_VERSION#v}</string>
             <key>CFBundleVersion</key><string>${EDIT_VERSION#v}</string>

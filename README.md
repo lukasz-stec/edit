@@ -1,3 +1,5 @@
+<img src="assets/icon.png" width="96" alt="">
+
 # edit
 
 A fast, native text editor in the spirit of Sublime Text, with the editing features
@@ -128,6 +130,7 @@ Install Rust from [rustup.rs](https://rustup.rs) (on Windows, with the MSVC buil
 ```sh
 cargo build --release      # binary in target/release/
 cargo test
+cargo run --example mkicon  # regenerate assets/icon.* after changing src/icon.rs
 ```
 
 On Linux, install the GTK 3 and xkbcommon development packages first

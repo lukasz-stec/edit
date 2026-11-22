@@ -6,6 +6,7 @@ mod diffview;
 mod doc;
 mod editor;
 mod highlight;
+mod icon;
 mod keymap;
 mod search;
 mod selection;
@@ -23,7 +24,8 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([480.0, 320.0])
             .with_title("edit")
-            .with_drag_and_drop(true),
+            .with_drag_and_drop(true)
+            .with_icon(std::sync::Arc::new(egui::IconData { rgba: icon::rgba(128), width: 128, height: 128 })),
         ..Default::default()
     };
     eframe::run_native("edit", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, args)))))
