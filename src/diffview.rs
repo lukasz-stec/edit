@@ -120,6 +120,8 @@ pub struct Ctx<'a> {
     pub find: &'a [(usize, usize)],
     pub right_id: Id,
     pub left_id: Id,
+    /// Both sides are snapshots (Local History window): no revert buttons, no close.
+    pub read_only: bool,
 }
 
 pub enum Outcome {
@@ -155,10 +157,10 @@ pub fn show(ui: &mut egui::Ui, right: &mut Document, view: &mut View, st: &mut D
             n => format!("{n} differences"),
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("× Close diff").on_hover_text("Esc").clicked() {
+            if !cx.read_only && ui.button("× Close diff").on_hover_text("Esc").clicked() {
                 outcome = Outcome::Close;
             }
-            if n > 0
+            if n > 0 && !cx.read_only
                 && ui
                     .button("« Revert All")
                     .on_hover_text("Replace the whole right side with the left side (Ctrl+Z undoes)")
@@ -255,7 +257,7 @@ pub fn show(ui: &mut egui::Ui, right: &mut Document, view: &mut View, st: &mut D
 
         // "»" revert button at the top-left of the band
         let br = Rect::from_min_size(pos2(drect.left() + 2.0, l0.max(drect.top()) + 1.0), vec2(18.0, 16.0));
-        if drect.contains(br.center()) {
+        if !cx.read_only && drect.contains(br.center()) {
             let resp = ui
                 .interact(br, cx.left_id.with(("revert", i)), Sense::click())
                 .on_hover_text("Revert: replace the right side with the left side");

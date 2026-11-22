@@ -6,6 +6,7 @@ mod diffview;
 mod doc;
 mod editor;
 mod findfiles;
+mod git;
 mod highlight;
 mod history;
 mod icon;

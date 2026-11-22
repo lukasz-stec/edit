@@ -32,6 +32,7 @@ pub enum Event {
     ChangedOnDisk,
     BeforeReplace,
     Replaced,
+    Reverted,
 }
 
 impl Event {
@@ -42,6 +43,7 @@ impl Event {
             Event::ChangedOnDisk => "external",
             Event::BeforeReplace => "before-replace",
             Event::Replaced => "replaced",
+            Event::Reverted => "reverted",
         }
     }
 
@@ -52,6 +54,7 @@ impl Event {
             "external" => "Changed on disk",
             "before-replace" => "Before Replace in Files",
             "replaced" => "Replace in Files",
+            "reverted" => "Reverted from Local History",
             _ => "Version",
         }
     }

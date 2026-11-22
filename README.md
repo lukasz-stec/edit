@@ -45,6 +45,9 @@ Pass files or a folder on the command line: `edit path/to/project path/to/file.r
 - **Local History** like IntelliJ: every file version you open, save, or that changes on disk
   is kept for 30 days (compressed, deduplicated, written in the background). Pick a version
   to compare it with the current text and revert single changes or everything.
+- **Git status in the sidebar** like IntelliJ: modified (blue), added (green), untracked (red),
+  ignored (olive) and conflicted files; folders show their changes; the branch is in the
+  status bar. Refreshed in the background when files or the repository change.
 - **Follows the disk**: the sidebar updates when files are created, deleted or renamed,
   and open files reload when another program changes them (your unsaved edits are
   never overwritten; you get a warning instead).
@@ -114,7 +117,7 @@ On macOS, `Cmd` works wherever `Ctrl` is listed.
 |---|---|
 | `Ctrl+D` | Show diff: two files selected in the sidebar, else unsaved changes, else Git HEAD |
 | `F7` / `Shift+F7` | Next / previous change |
-| `Alt+Shift+H` | Local History of the current file (right-click a file or folder in the sidebar for its history; deleted files can be restored) |
+| `Alt+Shift+H` | Local History window for the current file (right-click a file or folder in the sidebar for its history); compare a version with the current text or with the version before it, revert, restore deleted files |
 | Ctrl+click two files in the sidebar, right-click | Compare selected files |
 
 More comparisons (clipboard, another file, another tab) are in the **Diff** menu.

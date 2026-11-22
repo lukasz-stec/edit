@@ -7,6 +7,7 @@ use crate::history::{self, History};
 use crate::highlight::{config_dir, lerp, Colors, LineCache, Syntax};
 use crate::keymap::{self, Cmd};
 use crate::findfiles;
+use crate::git;
 use crate::search;
 use crate::selection::Sel;
 use crate::session::{self, FileState, Session};
@@ -35,7 +36,6 @@ enum PMode {
     Syntaxes,
     Clipboard,
     DiffTab,
-    History,
 }
 
 #[derive(Clone)]
@@ -47,7 +47,6 @@ enum PAction {
     Syntax(String),
     Clip(usize),
     DiffTab(usize),
-    History(usize),
 }
 
 struct PItem {
@@ -106,6 +105,29 @@ struct Fif {
     undo: Vec<(PathBuf, String, String)>,
     /// After a replace, re-select this file and line once the new results arrive.
     resume: Option<(PathBuf, usize)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HistCompare {
+    /// Selected version (left) against the file as it is now (right).
+    Current,
+    /// The version before it (left) against the selected version (right): what changed then.
+    Previous,
+}
+
+/// Local History window (IntelliJ-style): versions on the left, a read-only diff on the right.
+struct HistView {
+    /// The file, or the folder whose files are listed.
+    target: PathBuf,
+    folder: bool,
+    entries: Vec<(PathBuf, history::Version)>,
+    sel: usize,
+    compare: HistCompare,
+    filter: String,
+    /// Diff for `(sel, compare)`: the diff state and its right side.
+    shown: Option<((usize, HistCompare), DiffState, Document, View)>,
+    focus_list: bool,
+    scroll_to_sel: bool,
 }
 
 enum TreeAction {
@@ -179,11 +201,15 @@ pub struct App {
     /// When the Go to File list went stale (re-walked after 0.5s without changes).
     files_stale: Option<f64>,
     fif: Fif,
+    git: git::GitWatch,
+    /// Files or the repository changed at this time: refresh git status soon.
+    git_dirty_at: Option<f64>,
+    /// Sidebar folders the git status was last computed for.
+    git_roots: Vec<PathBuf>,
     history: History,
     /// File and versions listed by the Local History palette.
-    history_list: Vec<(PathBuf, history::Version)>,
-    /// Folder whose history is listed (None: a single file).
-    history_folder: Option<PathBuf>,
+    /// Local History window, shown instead of the editor while open.
+    hist: Option<HistView>,
 }
 
 impl App {
@@ -240,9 +266,11 @@ impl App {
             fs: FsWatch::new(cc.egui_ctx.clone()),
             files_stale: None,
             fif: Fif::default(),
+            git: git::GitWatch::new(),
+            git_dirty_at: Some(0.0),
+            git_roots: vec![],
             history: History::start(),
-            history_list: vec![],
-            history_folder: None,
+            hist: None,
         };
         let session = Session::load();
         let had_session = session.is_some();
@@ -1203,32 +1231,6 @@ impl App {
                     }
                 }
             }
-            PMode::History => {
-                let now = history::now_ms();
-                let mut exists: HashMap<&Path, bool> = HashMap::new();
-                for (i, (p, v)) in self.history_list.iter().enumerate() {
-                    let (time, day) = history::format_time(v.time);
-                    let ago = match now.saturating_sub(v.time) / 1000 {
-                        s if s < 60 => format!("{s} s ago"),
-                        s if s < 3600 => format!("{} min ago", s / 60),
-                        s if s < 86400 => format!("{} h ago", s / 3600),
-                        s => format!("{} days ago", s / 86400),
-                    };
-                    let event = history::Event::label(&v.event);
-                    let (label, mut detail) = match &self.history_folder {
-                        // folder history: which file, then what happened
-                        Some(dir) => {
-                            let rel = p.strip_prefix(dir).unwrap_or(p).to_string_lossy().replace('\\', "/");
-                            (format!("{day} {time}   {rel}"), format!("{event} · {ago}"))
-                        }
-                        None => (format!("{day} {time}   {event}"), format!("{ago} · {} chars", v.chars)),
-                    };
-                    if !*exists.entry(p.as_path()).or_insert_with(|| p.exists()) {
-                        detail += " · deleted (pick to restore)";
-                    }
-                    push(label, detail, PAction::History(i), query);
-                }
-            }
         }
         if !query.is_empty() && mode != PMode::Clipboard {
             items.sort_by(|a, b| b.0.cmp(&a.0));
@@ -1283,7 +1285,6 @@ impl App {
             PMode::Syntaxes => "Set syntax…",
             PMode::Clipboard => "Paste from history…",
             PMode::DiffTab => "Compare with tab…",
-            PMode::History => "Local history: pick a version to compare…",
         };
         let colors = self.colors.clone();
         egui::Area::new(Id::new("palette"))
@@ -1391,30 +1392,6 @@ impl App {
                     self.open_diff(ctx, Ok(text), title);
                 }
             }
-            PAction::History(i) => {
-                let Some((path, v)) = self.history_list.get(i).cloned() else { return };
-                let Some(text) = self.history.load(&v) else {
-                    return self.set_status(ctx, "This version is no longer stored");
-                };
-                let open = self.tabs.iter().any(|t| t.doc.path.as_ref() == Some(&path));
-                if !open && !path.exists() {
-                    // deleted file: bring this version back as an unsaved buffer
-                    let mut doc = Document::new();
-                    doc.path = Some(path.clone());
-                    doc.camel_humps = self.camel_humps;
-                    doc.load_backup(&text, false);
-                    let syntax = self.syn.detect(Some(&path), &line_text(&doc.rope, 0));
-                    self.push_tab(Tab { doc, view: View::new(syntax), diff: None });
-                    self.focus_editor(ctx);
-                    return self.set_status(ctx, format!("Restored {} from local history; save to recreate it", file_name(&path)));
-                }
-                if self.tabs[self.active].doc.path.as_ref() != Some(&path) {
-                    self.open_path(&path);
-                }
-                let (time, day) = history::format_time(v.time);
-                let title = format!("Local History: {day} {time} ({})", history::Event::label(&v.event));
-                self.open_diff(ctx, Ok(text), title);
-            }
         }
     }
 
@@ -1461,30 +1438,284 @@ impl App {
                     self.show_history(ctx);
                 }
             }
-            TreeAction::FolderHistory(dir) => {
-                let versions = self.history.versions_under(&dir, 5000);
-                if versions.is_empty() {
-                    return self.set_status(ctx, format!("No local history under {} yet", file_name(&dir)));
-                }
-                self.history_list = versions;
-                self.history_folder = Some(dir);
-                self.open_palette(PMode::History, "");
-            }
+            TreeAction::FolderHistory(dir) => self.open_history(ctx, dir, true),
         }
     }
 
-    /// Local History of the current file: list its versions in the palette.
+    /// Local History of the current file (Alt+Shift+H).
     fn show_history(&mut self, ctx: &egui::Context) {
         let Some(path) = self.tabs[self.active].doc.path.clone() else {
             return self.set_status(ctx, "Local history is kept for saved files only");
         };
-        let versions = self.history.versions(&path);
-        if versions.is_empty() {
-            return self.set_status(ctx, format!("No local history for {} yet", file_name(&path)));
+        self.open_history(ctx, path, false);
+    }
+
+    fn history_entries(&self, target: &Path, folder: bool) -> Vec<(PathBuf, history::Version)> {
+        if folder {
+            self.history.versions_under(target, 5000)
+        } else {
+            self.history.versions(target).into_iter().map(|v| (target.to_path_buf(), v)).collect()
         }
-        self.history_list = versions.into_iter().map(|v| (path.clone(), v)).collect();
-        self.history_folder = None;
-        self.open_palette(PMode::History, "");
+    }
+
+    fn open_history(&mut self, ctx: &egui::Context, target: PathBuf, folder: bool) {
+        let entries = self.history_entries(&target, folder);
+        if entries.is_empty() {
+            return self.set_status(ctx, format!("No local history for {} yet", file_name(&target)));
+        }
+        self.palette = None;
+        self.hist = Some(HistView {
+            target,
+            folder,
+            entries,
+            sel: 0,
+            compare: HistCompare::Current,
+            filter: String::new(),
+            shown: None,
+            focus_list: true,
+            scroll_to_sel: true,
+        });
+    }
+
+    /// The text of `path` as it is now: the open tab's buffer, else the file (None: deleted).
+    fn current_text(&self, path: &Path) -> Option<String> {
+        if let Some(t) = self.tabs.iter().find(|t| t.doc.path.as_deref() == Some(path)) {
+            return Some(t.doc.rope.to_string());
+        }
+        let bytes = std::fs::read(path).ok()?;
+        let text = String::from_utf8_lossy(&bytes);
+        Some(text.strip_prefix('\u{feff}').unwrap_or(&text).replace("\r\n", "\n"))
+    }
+
+    /// Build the diff for the selected version, unless it's already shown.
+    fn hist_build(&mut self) {
+        let Some(h) = &self.hist else { return };
+        let key = (h.sel, h.compare);
+        if h.shown.as_ref().is_some_and(|s| s.0 == key) {
+            return;
+        }
+        let Some((path, v)) = h.entries.get(h.sel).cloned() else { return };
+        let label = |v: &history::Version| {
+            let (time, day) = history::format_time(v.time);
+            format!("{day} {time} · {}", history::Event::label(&v.event))
+        };
+        let this = self.history.load(&v).unwrap_or_default();
+        let (left, left_title, right, right_title) = match h.compare {
+            HistCompare::Current => {
+                let (now, title) = match self.current_text(&path) {
+                    Some(t) => (t, "Current".to_string()),
+                    None => (String::new(), "Current: file deleted".to_string()),
+                };
+                (this, label(&v), now, title)
+            }
+            HistCompare::Previous => {
+                let all = self.history.versions(&path); // newest first
+                let prev = all.iter().position(|x| *x == v).and_then(|i| all.get(i + 1));
+                match prev {
+                    Some(p) => (self.history.load(p).unwrap_or_default(), label(p), this, label(&v)),
+                    None => (String::new(), "(no earlier version)".to_string(), this, label(&v)),
+                }
+            }
+        };
+        let mut doc = Document::from_str(&right);
+        doc.path = Some(path.clone());
+        doc.camel_humps = self.camel_humps;
+        let view = View::new(self.syn.detect(Some(&path), &line_text(&doc.rope, 0)));
+        let mut st = DiffState::new(&left, left_title, &doc, &view);
+        st.right_title = right_title;
+        if let Some(h) = self.hist.as_mut() {
+            h.shown = Some((key, st, doc, view));
+        }
+    }
+
+    /// Make the selected version the file's content: an undoable edit if the file is open,
+    /// otherwise written to disk (recreating a deleted file).
+    fn hist_revert(&mut self, ctx: &egui::Context) {
+        let Some((path, v)) = self.hist.as_ref().and_then(|h| h.entries.get(h.sel).cloned()) else { return };
+        let Some(text) = self.history.load(&v) else {
+            return self.set_status(ctx, "This version is no longer stored");
+        };
+        let (time, day) = history::format_time(v.time);
+        if let Some(t) = self.tabs.iter().position(|t| t.doc.path.as_ref() == Some(&path)) {
+            let doc = &mut self.tabs[t].doc;
+            let end = doc.rope.len_chars();
+            let head = doc.primary_sel().head;
+            doc.apply(EditKind::Other, vec![Edit { start: 0, end, text, anchor: 0, head: 0 }]);
+            let c = head.min(doc.rope.len_chars());
+            doc.set_sels(vec![Sel::caret(c)], 0);
+            self.set_status(ctx, format!("{} reverted to {day} {time} (unsaved; Ctrl+Z undoes)", file_name(&path)));
+        } else {
+            // keep the file's line endings
+            let crlf = std::fs::read(&path).is_ok_and(|b| b.windows(2).any(|w| w == b"\r\n"));
+            let out = if crlf { text.replace('\n', "\r\n") } else { text.clone() };
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Err(e) = std::fs::write(&path, out) {
+                return self.set_status(ctx, format!("Could not write {}: {e}", path.display()));
+            }
+            self.history.record_str(&path, &text, history::Event::Reverted);
+            self.set_status(ctx, format!("{} reverted to {day} {time} and saved", file_name(&path)));
+        }
+        if let Some(h) = self.hist.as_mut() {
+            h.shown = None; // the current side changed
+        }
+    }
+
+    fn hist_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        let list_id = Id::new("hist_list");
+        let c = self.colors.clone();
+        // keyboard: ↑↓ pick a version, Esc closes (when the list or filter has focus)
+        let filter_id = Id::new("hist_filter");
+        if ctx.memory(|m| m.has_focus(list_id) || m.has_focus(filter_id)) {
+            let (esc, up, down) = ctx.input_mut(|i| {
+                (
+                    i.consume_key(Modifiers::NONE, Key::Escape),
+                    i.consume_key(Modifiers::NONE, Key::ArrowUp),
+                    i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                )
+            });
+            if esc {
+                self.hist = None;
+                self.focus_editor(ctx);
+                return;
+            }
+            if let Some(h) = self.hist.as_mut() {
+                let visible = hist_visible(h);
+                if let Some(pos) = visible.iter().position(|&i| i == h.sel) {
+                    let next = if down { visible.get(pos + 1) } else if up && pos > 0 { visible.get(pos - 1) } else { None };
+                    if let Some(&n) = next {
+                        (h.sel, h.scroll_to_sel) = (n, true);
+                    }
+                } else if (up || down) && !visible.is_empty() {
+                    (h.sel, h.scroll_to_sel) = (visible[0], true);
+                }
+            }
+        }
+
+        let mut close = false;
+        let mut revert = false;
+        let mut open_in_editor = false;
+        {
+            let Some(h) = self.hist.as_mut() else { return };
+            ui.horizontal(|ui| {
+                ui.add_space(6.0);
+                let what = if h.folder { "folder" } else { "file" };
+                ui.label(RichText::new(format!("Local History of {what} {}", h.target.display())).strong());
+                ui.separator();
+                ui.label("Compare with:");
+                ui.radio_value(&mut h.compare, HistCompare::Current, "Current")
+                    .on_hover_text("The selected version against the file as it is now");
+                ui.radio_value(&mut h.compare, HistCompare::Previous, "Previous version")
+                    .on_hover_text("What changed in the selected version");
+                ui.separator();
+                revert = ui.button("Revert to This Version").on_hover_text("Open files: undoable edit. Others: written to disk.").clicked();
+                open_in_editor = ui.button("Open in Editor").on_hover_text("Editable diff of this version against the file").clicked();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    close = ui.button("× Close").on_hover_text("Esc").clicked();
+                });
+            });
+        }
+        if close {
+            self.hist = None;
+            return self.focus_editor(ctx);
+        }
+        if revert {
+            self.hist_revert(ctx);
+        }
+        if open_in_editor {
+            let Some((path, v)) = self.hist.as_ref().and_then(|h| h.entries.get(h.sel).cloned()) else { return };
+            if let Some(text) = self.history.load(&v) {
+                if !path.exists() && !self.tabs.iter().any(|t| t.doc.path.as_ref() == Some(&path)) {
+                    return self.set_status(ctx, "The file was deleted; use Revert to This Version to restore it");
+                }
+                self.hist = None;
+                self.open_path(&path);
+                let (time, day) = history::format_time(v.time);
+                return self.open_diff(ctx, Ok(text), format!("Local History: {day} {time}"));
+            }
+        }
+        self.hist_build();
+
+        let theme = self.syn.theme(&self.theme_name);
+        let Some(h) = self.hist.as_mut() else { return };
+        egui::SidePanel::left("hist_versions")
+            .resizable(true)
+            .default_width(if h.folder { 380.0 } else { 260.0 })
+            .frame(Frame::none().fill(c.panel).inner_margin(Margin::same(6.0)))
+            .show_inside(ui, |ui| {
+                if h.folder {
+                    let r = ui.add(TextEdit::singleline(&mut h.filter).id(filter_id).hint_text("Filter by file name…").desired_width(f32::INFINITY));
+                    if r.changed() {
+                        if let Some(&first) = hist_visible(h).first() {
+                            (h.sel, h.scroll_to_sel) = (first, true);
+                        }
+                    }
+                    ui.add_space(4.0);
+                }
+                // an invisible focus target, so ↑↓ work without a text field
+                let list_resp = ui.interact(ui.max_rect(), list_id, Sense::click());
+                if std::mem::take(&mut h.focus_list) {
+                    list_resp.request_focus();
+                }
+                let now = history::now_ms();
+                let scroll_to = std::mem::take(&mut h.scroll_to_sel);
+                let mut exists: HashMap<PathBuf, bool> = HashMap::new();
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    let mut last_day = String::new();
+                    for i in hist_visible(h) {
+                        let (path, v) = &h.entries[i];
+                        let (time, day) = history::format_time(v.time);
+                        if day != last_day {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(day.to_uppercase()).small().weak());
+                            last_day = day;
+                        }
+                        let ago = match now.saturating_sub(v.time) / 1000 {
+                            s if s < 60 => format!("{s} s ago"),
+                            s if s < 3600 => format!("{} min ago", s / 60),
+                            s if s < 86400 => format!("{} h ago", s / 3600),
+                            s => format!("{} d ago", s / 86400),
+                        };
+                        let event = history::Event::label(&v.event);
+                        let mut text = format!("{time}  {event}");
+                        if h.folder {
+                            let rel = path.strip_prefix(&h.target).unwrap_or(path).to_string_lossy().replace('\\', "/");
+                            text = format!("{time}  {rel}\n          {event} · {ago}");
+                        }
+                        let deleted = !*exists.entry(path.clone()).or_insert_with(|| path.exists());
+                        let mut rt = RichText::new(text);
+                        if deleted {
+                            rt = rt.color(c.gutter_fg).strikethrough();
+                        }
+                        let r = ui.selectable_label(i == h.sel, rt);
+                        let r = if h.folder { r } else { r.on_hover_text(ago) };
+                        let r = if deleted { r.on_hover_text("Deleted since; Revert to This Version restores it") } else { r };
+                        if r.clicked() {
+                            h.sel = i;
+                            ui.memory_mut(|m| m.request_focus(list_id));
+                        }
+                        if scroll_to && i == h.sel {
+                            r.scroll_to_me(None);
+                        }
+                    }
+                });
+            });
+        egui::CentralPanel::default().frame(Frame::none().fill(c.bg)).show_inside(ui, |ui| {
+            if let Some((_, st, doc, view)) = h.shown.as_mut() {
+                let cx = diffview::Ctx {
+                    syn: &self.syn,
+                    theme,
+                    colors: &self.colors,
+                    settings: &self.settings,
+                    find: &[],
+                    right_id: Id::new("hist_right"),
+                    left_id: Id::new("hist_left"),
+                    read_only: true,
+                };
+                diffview::show(ui, doc, view, st, &cx);
+            }
+        });
     }
 
     fn open_diff(&mut self, ctx: &egui::Context, left: Result<String, String>, title: String) {
@@ -2076,6 +2307,9 @@ impl App {
                 }
             }
             self.dir_cache.remove(&c.path);
+            if git::affects_status(&c.path, SKIP_DIRS) {
+                self.git_dirty_at = Some(now);
+            }
             touched.insert(c.path);
         }
         if rescan {
@@ -2085,6 +2319,22 @@ impl App {
         for i in 0..self.tabs.len() {
             if self.tabs[i].doc.path.as_ref().is_some_and(|p| rescan || touched.contains(p)) {
                 self.reload_from_disk(ctx, i);
+            }
+        }
+        // git status: refreshed in the background after changes settle, one run at a time
+        self.git.poll();
+        if self.git_roots != self.roots {
+            self.git_roots = self.roots.clone();
+            self.git_dirty_at = Some(0.0);
+        }
+        if let Some(t) = self.git_dirty_at {
+            if self.git.busy() {
+                // runs again when the current refresh finishes (it wakes the UI)
+            } else if now - t >= 0.4 {
+                self.git_dirty_at = None;
+                self.git.refresh(self.roots.clone(), ctx.clone());
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(0.41 - (now - t)));
             }
         }
         if let Some(t) = self.files_stale {
@@ -2128,7 +2378,11 @@ impl App {
         for (path, is_dir) in children {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             if is_dir {
-                let r = egui::CollapsingHeader::new(RichText::new(&name))
+                let mut label = RichText::new(&name);
+                if let Some(st) = self.git.dir(&path) {
+                    label = label.color(st.color());
+                }
+                let r = egui::CollapsingHeader::new(label)
                     .id_salt(&path)
                     .default_open(false)
                     .show(ui, |ui| self.tree_ui(ui, &path, active));
@@ -2141,7 +2395,11 @@ impl App {
             } else {
                 let is_active = active == Some(path.as_path());
                 let selected = self.tree_sel.contains(&path);
+                let git = self.git.file(&path);
                 let mut text = RichText::new(&name);
+                if let Some(st) = git {
+                    text = text.color(st.color());
+                }
                 if selected && self.tree_sel.len() > 1 {
                     text = text.strong().underline();
                 }
@@ -2164,7 +2422,10 @@ impl App {
                         self.to_open = Some(path.clone());
                     }
                 }
-                let r = r.on_hover_text(path.to_string_lossy());
+                let r = r.on_hover_text(match git {
+                    Some(st) => format!("{} · {}", path.display(), st.name()),
+                    None => path.display().to_string(),
+                });
                 r.context_menu(|ui| {
                     // right-clicking outside the selection acts on that file alone
                     if !self.tree_sel.contains(&path) {
@@ -2339,6 +2600,10 @@ impl eframe::App for App {
                     left += &format!("  ·  {} characters selected", s.end() - s.start());
                 }
                 ui.label(RichText::new(left).small());
+                if let Some(b) = self.git.branch(d.path.as_deref()) {
+                    ui.separator();
+                    ui.label(RichText::new(format!("Git: {b}")).small()).on_hover_text("Current Git branch");
+                }
                 if let Some((msg, _)) = &self.status {
                     ui.separator();
                     ui.label(RichText::new(msg).small().strong());
@@ -2372,7 +2637,11 @@ impl eframe::App for App {
                     let mut activate = None;
                     for (i, t) in self.tabs.iter().enumerate() {
                         let name = if t.doc.is_dirty() { format!("● {}", t.doc.name()) } else { t.doc.name() };
-                        if ui.selectable_label(i == self.active, name).clicked() {
+                        let mut text = RichText::new(name);
+                        if let Some(st) = t.doc.path.as_deref().and_then(|p| self.git.file(p)) {
+                            text = text.color(st.color());
+                        }
+                        if ui.selectable_label(i == self.active, text).clicked() {
                             activate = Some(i);
                         }
                     }
@@ -2502,6 +2771,9 @@ impl eframe::App for App {
 
         // ---------------- editor
         egui::CentralPanel::default().frame(Frame::none().fill(c.bg)).show(ctx, |ui| {
+            if self.hist.is_some() {
+                return self.hist_ui(ctx, ui);
+            }
             let theme = self.syn.theme(&self.theme_name);
             let find: &[(usize, usize)] = if self.find.open { &self.find.matches } else { &[] };
             let tab = &mut self.tabs[self.active];
@@ -2514,6 +2786,7 @@ impl eframe::App for App {
                     find,
                     right_id: self.editor_id,
                     left_id: self.diff_left_id,
+                    read_only: false,
                 };
                 if let diffview::Outcome::Close = diffview::show(ui, &mut tab.doc, &mut tab.view, d, &cx) {
                     tab.diff = None;
@@ -2702,6 +2975,19 @@ fn git_head_text(path: &Path) -> Result<String, String> {
         return Err(format!("git: {}", err.lines().next().unwrap_or("file is not in HEAD").trim()));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Indices of the Local History entries matching the folder filter (file name/path).
+fn hist_visible(h: &HistView) -> Vec<usize> {
+    let f = h.filter.to_lowercase();
+    h.entries
+        .iter()
+        .enumerate()
+        .filter(|(_, (p, _))| {
+            f.is_empty() || p.strip_prefix(&h.target).unwrap_or(p).to_string_lossy().to_lowercase().contains(&f)
+        })
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// Warning text colour (amber).
