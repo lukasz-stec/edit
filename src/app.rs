@@ -114,6 +114,7 @@ enum TreeAction {
     /// Diff a file against the active editor.
     CompareWithActive(PathBuf),
     History(PathBuf),
+    FolderHistory(PathBuf),
 }
 
 enum Pending {
@@ -180,7 +181,9 @@ pub struct App {
     fif: Fif,
     history: History,
     /// File and versions listed by the Local History palette.
-    history_list: (PathBuf, Vec<history::Version>),
+    history_list: Vec<(PathBuf, history::Version)>,
+    /// Folder whose history is listed (None: a single file).
+    history_folder: Option<PathBuf>,
 }
 
 impl App {
@@ -238,7 +241,8 @@ impl App {
             files_stale: None,
             fif: Fif::default(),
             history: History::start(),
-            history_list: (PathBuf::new(), vec![]),
+            history_list: vec![],
+            history_folder: None,
         };
         let session = Session::load();
         let had_session = session.is_some();
@@ -1201,7 +1205,8 @@ impl App {
             }
             PMode::History => {
                 let now = history::now_ms();
-                for (i, v) in self.history_list.1.iter().enumerate() {
+                let mut exists: HashMap<&Path, bool> = HashMap::new();
+                for (i, (p, v)) in self.history_list.iter().enumerate() {
                     let (time, day) = history::format_time(v.time);
                     let ago = match now.saturating_sub(v.time) / 1000 {
                         s if s < 60 => format!("{s} s ago"),
@@ -1209,8 +1214,19 @@ impl App {
                         s if s < 86400 => format!("{} h ago", s / 3600),
                         s => format!("{} days ago", s / 86400),
                     };
-                    let label = format!("{day} {time}   {}", history::Event::label(&v.event));
-                    push(label, format!("{ago} · {} chars", v.chars), PAction::History(i), query);
+                    let event = history::Event::label(&v.event);
+                    let (label, mut detail) = match &self.history_folder {
+                        // folder history: which file, then what happened
+                        Some(dir) => {
+                            let rel = p.strip_prefix(dir).unwrap_or(p).to_string_lossy().replace('\\', "/");
+                            (format!("{day} {time}   {rel}"), format!("{event} · {ago}"))
+                        }
+                        None => (format!("{day} {time}   {event}"), format!("{ago} · {} chars", v.chars)),
+                    };
+                    if !*exists.entry(p.as_path()).or_insert_with(|| p.exists()) {
+                        detail += " · deleted (pick to restore)";
+                    }
+                    push(label, detail, PAction::History(i), query);
                 }
             }
         }
@@ -1376,15 +1392,28 @@ impl App {
                 }
             }
             PAction::History(i) => {
-                let Some(v) = self.history_list.1.get(i).cloned() else { return };
-                let path = self.history_list.0.clone();
+                let Some((path, v)) = self.history_list.get(i).cloned() else { return };
+                let Some(text) = self.history.load(&v) else {
+                    return self.set_status(ctx, "This version is no longer stored");
+                };
+                let open = self.tabs.iter().any(|t| t.doc.path.as_ref() == Some(&path));
+                if !open && !path.exists() {
+                    // deleted file: bring this version back as an unsaved buffer
+                    let mut doc = Document::new();
+                    doc.path = Some(path.clone());
+                    doc.camel_humps = self.camel_humps;
+                    doc.load_backup(&text, false);
+                    let syntax = self.syn.detect(Some(&path), &line_text(&doc.rope, 0));
+                    self.push_tab(Tab { doc, view: View::new(syntax), diff: None });
+                    self.focus_editor(ctx);
+                    return self.set_status(ctx, format!("Restored {} from local history; save to recreate it", file_name(&path)));
+                }
                 if self.tabs[self.active].doc.path.as_ref() != Some(&path) {
                     self.open_path(&path);
                 }
                 let (time, day) = history::format_time(v.time);
                 let title = format!("Local History: {day} {time} ({})", history::Event::label(&v.event));
-                let text = self.history.load(&v).ok_or_else(|| "This version is no longer stored".to_string());
-                self.open_diff(ctx, text, title);
+                self.open_diff(ctx, Ok(text), title);
             }
         }
     }
@@ -1432,6 +1461,15 @@ impl App {
                     self.show_history(ctx);
                 }
             }
+            TreeAction::FolderHistory(dir) => {
+                let versions = self.history.versions_under(&dir, 5000);
+                if versions.is_empty() {
+                    return self.set_status(ctx, format!("No local history under {} yet", file_name(&dir)));
+                }
+                self.history_list = versions;
+                self.history_folder = Some(dir);
+                self.open_palette(PMode::History, "");
+            }
         }
     }
 
@@ -1444,7 +1482,8 @@ impl App {
         if versions.is_empty() {
             return self.set_status(ctx, format!("No local history for {} yet", file_name(&path)));
         }
-        self.history_list = (path, versions);
+        self.history_list = versions.into_iter().map(|v| (path.clone(), v)).collect();
+        self.history_folder = None;
         self.open_palette(PMode::History, "");
     }
 
@@ -2089,10 +2128,16 @@ impl App {
         for (path, is_dir) in children {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             if is_dir {
-                egui::CollapsingHeader::new(RichText::new(&name))
+                let r = egui::CollapsingHeader::new(RichText::new(&name))
                     .id_salt(&path)
                     .default_open(false)
                     .show(ui, |ui| self.tree_ui(ui, &path, active));
+                r.header_response.context_menu(|ui| {
+                    if ui.button("Local History…").on_hover_text("Changes to all files in this folder").clicked() {
+                        self.tree_action = Some(TreeAction::FolderHistory(path.clone()));
+                        ui.close_menu();
+                    }
+                });
             } else {
                 let is_active = active == Some(path.as_path());
                 let selected = self.tree_sel.contains(&path);
@@ -2354,6 +2399,10 @@ impl eframe::App for App {
                                 .show_header(ui, |ui| {
                                     let r = ui.label(RichText::new(name.to_uppercase()).small().strong()).on_hover_text(root.display().to_string());
                                     r.context_menu(|ui| {
+                                        if ui.button("Local History…").on_hover_text("Changes to all files in this folder").clicked() {
+                                            self.tree_action = Some(TreeAction::FolderHistory(root.clone()));
+                                            ui.close_menu();
+                                        }
                                         if ui.button("Remove Folder from Sidebar").clicked() {
                                             remove = Some(i);
                                             ui.close_menu();

@@ -114,7 +114,7 @@ On macOS, `Cmd` works wherever `Ctrl` is listed.
 |---|---|
 | `Ctrl+D` | Show diff: two files selected in the sidebar, else unsaved changes, else Git HEAD |
 | `F7` / `Shift+F7` | Next / previous change |
-| `Alt+Shift+H` | Local History of the current file (also: right-click a file in the sidebar) |
+| `Alt+Shift+H` | Local History of the current file (right-click a file or folder in the sidebar for its history; deleted files can be restored) |
 | Ctrl+click two files in the sidebar, right-click | Compare selected files |
 
 More comparisons (clipboard, another file, another tab) are in the **Diff** menu.

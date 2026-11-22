@@ -142,6 +142,24 @@ impl History {
         v
     }
 
+    /// Versions of every file under `dir` (including files deleted since), newest first.
+    pub fn versions_under(&self, dir: &Path, limit: usize) -> Vec<(PathBuf, Version)> {
+        let Some(root) = &self.dir else { return vec![] };
+        let mut out = vec![];
+        if let Ok(rd) = std::fs::read_dir(root.join("index")) {
+            for e in rd.flatten() {
+                if let Some((file, versions)) = read_log(&e.path()) {
+                    if file.starts_with(dir) {
+                        out.extend(versions.into_iter().map(|v| (file.clone(), v)));
+                    }
+                }
+            }
+        }
+        out.sort_by(|a, b| b.1.time.cmp(&a.1.time));
+        out.truncate(limit);
+        out
+    }
+
     pub fn load(&self, v: &Version) -> Option<String> {
         let bytes = std::fs::read(self.dir.as_ref()?.join("blobs").join(&v.blob)).ok()?;
         let raw = miniz_oxide::inflate::decompress_to_vec(&bytes).ok()?;
@@ -313,6 +331,30 @@ mod tests {
         assert_eq!(v.iter().map(|x| (x.time, x.event.as_str())).collect::<Vec<_>>(), vec![(3, "saved"), (1, "opened")]);
         assert_eq!(h.load(&v[0]).unwrap(), "fn main() { run(); }\n");
         assert_eq!(h.load(&v[1]).unwrap(), "fn main() {}\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn folder_history_lists_files_below_newest_first() {
+        let root = std::env::temp_dir().join(format!("edit-history-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("blobs")).unwrap();
+        std::fs::create_dir_all(root.join("index")).unwrap();
+        let mut last = HashMap::new();
+        let proj = PathBuf::from("/proj");
+        let text = |s: &str| Rope::from_str(s);
+        write_version(&root, &mut last, &proj.join("a.rs"), &text("a1"), Event::Saved, 10).unwrap();
+        write_version(&root, &mut last, &proj.join("sub").join("b.rs"), &text("b1"), Event::Saved, 30).unwrap();
+        write_version(&root, &mut last, &proj.join("a.rs"), &text("a2"), Event::Saved, 20).unwrap();
+        write_version(&root, &mut last, Path::new("/project-other/c.rs"), &text("c1"), Event::Saved, 40).unwrap();
+        let h = History { dir: Some(root.clone()), tx: None, worker: None };
+        let got: Vec<(String, u64)> = h
+            .versions_under(&proj, 100)
+            .into_iter()
+            .map(|(p, v)| (p.strip_prefix(&proj).unwrap().to_string_lossy().replace('\\', "/"), v.time))
+            .collect();
+        // "/project-other" shares the text prefix but is not inside /proj
+        assert_eq!(got, vec![("sub/b.rs".into(), 30), ("a.rs".into(), 20), ("a.rs".into(), 10)]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
