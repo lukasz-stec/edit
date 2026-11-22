@@ -40,6 +40,7 @@ pub enum Cmd {
     DiffWithFile,
     DiffWithTab,
     DiffTreeSelection,
+    ShowDiff,
     CloseDiff,
     NextDiff,
     PrevDiff,
@@ -89,7 +90,7 @@ impl Cmd {
                 | CommandPalette | GotoAnything | GotoLine | Find | Replace | FindNext | FindPrev
                 | ToggleSidebar | ToggleMinimap | SelectTheme | SetSyntax | PasteFromHistory | ZoomIn
                 | ZoomOut | ZoomReset | ToggleCamelHumps | ToggleIndentation | ToggleLineEndings | ToggleColumnMode | Quit
-                | DiffWithSaved | DiffWithHead | DiffWithClipboard | DiffWithFile | DiffWithTab | DiffTreeSelection | CloseDiff
+                | DiffWithSaved | DiffWithHead | DiffWithClipboard | DiffWithFile | DiffWithTab | DiffTreeSelection | ShowDiff | CloseDiff
                 | NextDiff | PrevDiff
         )
     }
@@ -131,6 +132,7 @@ impl Cmd {
             DiffWithFile => "Diff: Compare with File…",
             DiffWithTab => "Diff: Compare with Open Tab…",
             DiffTreeSelection => "Diff: Compare Files Selected in Sidebar",
+            ShowDiff => "Diff: Show Diff (sidebar pair, unsaved changes or Git HEAD)",
             CloseDiff => "Diff: Close Diff",
             NextDiff => "Diff: Next Difference",
             PrevDiff => "Diff: Previous Difference",
@@ -178,7 +180,7 @@ impl Cmd {
             AddCaretAbove, AddCaretBelow, CaretsAtLineEnds, ToggleColumnMode, Duplicate, DeleteLine, MoveLineUp, MoveLineDown,
             ToggleComment, Indent, Outdent, JoinLines, SortLines, ToggleCase, InsertLineBelow,
             InsertLineAbove, GotoBracket, NextTab, PrevTab, Quit,
-            DiffWithSaved, DiffWithHead, DiffWithClipboard, DiffWithFile, DiffWithTab, DiffTreeSelection, CloseDiff,
+            DiffWithSaved, DiffWithHead, DiffWithClipboard, DiffWithFile, DiffWithTab, DiffTreeSelection, ShowDiff, CloseDiff,
             NextDiff, PrevDiff,
         ]
     }
@@ -231,7 +233,7 @@ const BINDINGS: &[B] = &[
     B(Cmd::SelectLine, C, Key::L),
     B(Cmd::ExpandSelection, C, Key::W),         // IntelliJ
     B(Cmd::ShrinkSelection, C | S, Key::W),     // IntelliJ
-    B(Cmd::SelectNextOccurrence, C, Key::D),    // Sublime
+    B(Cmd::ShowDiff, C, Key::D),                // IntelliJ "Show Diff"
     B(Cmd::SelectNextOccurrence, A, Key::J),    // IntelliJ
     B(Cmd::UnselectOccurrence, A | S, Key::J),  // IntelliJ
     B(Cmd::SelectAllOccurrences, A, Key::F3),   // Sublime

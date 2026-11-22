@@ -235,6 +235,37 @@ impl Document {
         self.dirty_line = Some(0);
     }
 
+    /// Replace the buffer with the file's new contents after an external change. The
+    /// reload is one undo step, carets keep their line/column, and the buffer counts as saved.
+    pub fn reload(&mut self, text: &str) {
+        let fresh = Document::from_str(text);
+        if self.rope == fresh.rope {
+            return;
+        }
+        let pos = |r: &Rope, c: usize| {
+            let l = r.char_to_line(c);
+            (l, c - r.line_to_char(l))
+        };
+        let old = self.rope.clone();
+        let sels: Vec<((usize, usize), (usize, usize), Option<usize>)> =
+            self.sels.iter().map(|s| (pos(&old, s.anchor), pos(&old, s.head), s.goal)).collect();
+        self.checkpoint(EditKind::Other);
+        let line = first_diff_line(&old, &fresh.rope);
+        self.rope = fresh.rope;
+        self.crlf = fresh.crlf;
+        let r = &self.rope;
+        let back = |(l, c): (usize, usize)| {
+            let l = l.min(r.len_lines() - 1);
+            (r.line_to_char(l) + c).min(line_end(r, l))
+        };
+        self.sels = sels.into_iter().map(|(a, h, g)| Sel { anchor: back(a), head: back(h), goal: g }).collect();
+        let len = self.rope.len_chars();
+        normalize(&mut self.sels, &mut self.primary, len);
+        self.block = None;
+        self.bump(line);
+        self.saved_version = self.version;
+    }
+
     pub fn save_to(&mut self, path: &Path) -> std::io::Result<()> {
         let mut s = self.rope.to_string();
         if self.crlf {
@@ -1512,6 +1543,18 @@ mod tests {
     }
     fn ranges(d: &Document) -> Vec<(usize, usize)> {
         d.sels.iter().map(|s| (s.anchor, s.head)).collect()
+    }
+
+    #[test]
+    fn reload_keeps_caret_line_and_is_undoable() {
+        let mut d = doc("one\ntwo\nthree\n", &[(9, 9)]); // "th|ree"
+        d.reload("zero\r\none\r\ntwo\r\nthree\r\n");
+        assert_eq!(d.rope.to_string(), "zero\none\ntwo\nthree\n");
+        assert!(d.crlf && !d.is_dirty());
+        assert_eq!(ranges(&d), vec![(10, 10)]); // same line 2, column 1 -> "t|wo"
+        d.undo();
+        assert_eq!(d.rope.to_string(), "one\ntwo\nthree\n");
+        assert!(d.is_dirty());
     }
 
     #[test]

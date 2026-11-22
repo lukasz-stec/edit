@@ -11,6 +11,7 @@ mod search;
 mod selection;
 mod session;
 mod text;
+mod watch;
 
 use eframe::egui;
 use std::path::PathBuf;

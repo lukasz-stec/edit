@@ -9,12 +9,13 @@ use crate::search;
 use crate::selection::Sel;
 use crate::session::{self, FileState, Session};
 use crate::text::line_text;
+use crate::watch::{self, FsWatch};
 use eframe::egui::{
     self, text::LayoutJob, vec2, Align2, Color32, Event, FontData, FontDefinitions, FontFamily,
     FontId, Frame, Id, ImeEvent, Key, Margin, Modifiers, RichText, Sense, TextEdit, TextFormat,
     ViewportCommand,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub struct Tab {
@@ -138,6 +139,10 @@ pub struct App {
     run_tag: String,
     /// doc id -> version last written to its backup file.
     backed_up: HashMap<u64, u64>,
+    /// Watches the project folder and the folders of open files.
+    fs: FsWatch,
+    /// When the Go to File list went stale (re-walked after 0.5s without changes).
+    files_stale: Option<f64>,
 }
 
 impl App {
@@ -191,6 +196,8 @@ impl App {
                 .map(|d| d.as_millis().to_string())
                 .unwrap_or_else(|_| std::process::id().to_string()),
             backed_up: HashMap::new(),
+            fs: FsWatch::new(cc.egui_ctx.clone()),
+            files_stale: None,
         };
         let session = Session::load();
         let had_session = session.is_some();
@@ -717,6 +724,20 @@ impl App {
                 Some((a, b)) => self.run_tree_action(ctx, TreeAction::Compare(a, b)),
                 None => self.set_status(ctx, "Ctrl+click two files in the sidebar first"),
             },
+            ShowDiff => {
+                if let Some((a, b)) = self.tree_pair() {
+                    self.run_tree_action(ctx, TreeAction::Compare(a, b));
+                } else if self.tabs[self.active].doc.path.is_none() {
+                    self.set_status(ctx, "Nothing to compare: save the file or Ctrl+click two files in the sidebar");
+                } else {
+                    // unsaved edits -> compare with disk; otherwise with the last commit
+                    let doc = &self.tabs[self.active].doc;
+                    let src = if doc.is_dirty() { DiffWithSaved } else { DiffWithHead };
+                    if let Some((text, title)) = self.diff_source(src) {
+                        self.open_diff(ctx, text, title);
+                    }
+                }
+            }
             DiffWithTab => {
                 if self.tabs.len() > 1 {
                     self.open_palette(PMode::DiffTab, "");
@@ -1390,6 +1411,77 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------ external changes
+
+    /// Follow changes on disk: refresh the tree and reload open files that changed.
+    fn sync_fs(&mut self, ctx: &egui::Context) {
+        let mut want = HashMap::new();
+        if let Some(r) = &self.root {
+            want.insert(r.clone(), watch::Mode::Recursive);
+        }
+        for t in &self.tabs {
+            if let Some(dir) = t.doc.path.as_ref().and_then(|p| p.parent()) {
+                if !self.root.as_ref().is_some_and(|r| dir.starts_with(r)) && dir.is_dir() {
+                    want.insert(dir.to_path_buf(), watch::Mode::NonRecursive);
+                }
+            }
+        }
+        self.fs.sync(&want);
+        let (changes, rescan) = self.fs.drain();
+        let now = ctx.input(|i| i.time);
+        let mut touched: HashSet<PathBuf> = HashSet::new();
+        for c in changes {
+            if c.structural {
+                if let Some(parent) = c.path.parent() {
+                    self.dir_cache.remove(parent);
+                }
+                let skipped = c.path.components().any(|p| SKIP_DIRS.iter().any(|s| p.as_os_str() == *s));
+                if !skipped {
+                    self.files_stale = Some(now);
+                }
+            }
+            self.dir_cache.remove(&c.path);
+            touched.insert(c.path);
+        }
+        if rescan {
+            self.dir_cache.clear();
+            self.files_stale = Some(now);
+        }
+        for i in 0..self.tabs.len() {
+            if self.tabs[i].doc.path.as_ref().is_some_and(|p| rescan || touched.contains(p)) {
+                self.reload_from_disk(ctx, i);
+            }
+        }
+        if let (Some(t), Some(root)) = (self.files_stale, self.root.clone()) {
+            if now - t >= 0.5 {
+                self.files = walk(&root, 50_000);
+                self.files_stale = None;
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(0.55 - (now - t)));
+            }
+        }
+    }
+
+    fn reload_from_disk(&mut self, ctx: &egui::Context, i: usize) {
+        let doc = &mut self.tabs[i].doc;
+        let Some(p) = doc.path.clone() else { return };
+        let Ok(bytes) = std::fs::read(&p) else { return }; // deleted, or locked mid-write
+        let text = String::from_utf8_lossy(&bytes);
+        let disk = text.strip_prefix('\u{feff}').unwrap_or(&text).replace("\r\n", "\n");
+        if doc.rope == disk.as_str() {
+            return; // unchanged, e.g. our own save
+        }
+        let name = doc.name();
+        if doc.is_dirty() {
+            self.set_status(ctx, format!("{name} changed on disk; your unsaved edits are kept (Ctrl+D compares)"));
+        } else {
+            doc.reload(&text);
+            if i == self.active {
+                self.set_status(ctx, format!("Reloaded {name}: changed on disk"));
+            }
+        }
+    }
+
     // ------------------------------------------------------------ sidebar
 
     fn tree_ui(&mut self, ui: &mut egui::Ui, dir: &Path, active: Option<&Path>) {
@@ -1523,6 +1615,7 @@ impl eframe::App for App {
             }
         }
 
+        self.sync_fs(ctx);
         self.handle_input(ctx);
         self.refresh_find();
         let c = self.colors.clone();
@@ -1559,7 +1652,7 @@ impl eframe::App for App {
                     }
                 });
                 ui.menu_button("Diff", |ui| {
-                    for cmd in [Cmd::DiffWithSaved, Cmd::DiffWithHead, Cmd::DiffWithClipboard, Cmd::DiffWithFile, Cmd::DiffWithTab, Cmd::DiffTreeSelection, Cmd::NextDiff, Cmd::PrevDiff, Cmd::CloseDiff] {
+                    for cmd in [Cmd::DiffWithSaved, Cmd::DiffWithHead, Cmd::DiffWithClipboard, Cmd::DiffWithFile, Cmd::DiffWithTab, Cmd::DiffTreeSelection, Cmd::ShowDiff, Cmd::NextDiff, Cmd::PrevDiff, Cmd::CloseDiff] {
                         item(ui, cmd, self);
                     }
                 });

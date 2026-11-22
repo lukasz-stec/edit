@@ -12,6 +12,7 @@ regex = "1"
 rfd = "0.15"
 similar = "2"
 arboard = "3"
+notify = "6"
 
 [profile.release]
 opt-level = 3
