@@ -20,6 +20,7 @@ pub enum Cmd {
     GotoAnything,
     GotoLine,
     Find,
+    FindInFiles,
     Replace,
     FindNext,
     FindPrev,
@@ -88,7 +89,7 @@ impl Cmd {
         matches!(
             self,
             NewFile | OpenFile | OpenFolder | AddFolder | Save | SaveAs | SaveAll | CloseTab | NextTab | PrevTab
-                | CommandPalette | GotoAnything | GotoLine | Find | Replace | FindNext | FindPrev
+                | CommandPalette | GotoAnything | GotoLine | Find | FindInFiles | Replace | FindNext | FindPrev
                 | ToggleSidebar | ToggleMinimap | SelectTheme | SetSyntax | PasteFromHistory | ZoomIn
                 | ZoomOut | ZoomReset | ToggleCamelHumps | ToggleIndentation | ToggleLineEndings | ToggleColumnMode | Quit
                 | DiffWithSaved | DiffWithHead | DiffWithClipboard | DiffWithFile | DiffWithTab | DiffTreeSelection | ShowDiff | CloseDiff
@@ -113,6 +114,7 @@ impl Cmd {
             GotoAnything => "Goto Anything (files)",
             GotoLine => "Goto Line…",
             Find => "Find…",
+            FindInFiles => "Find in Files…",
             Replace => "Replace…",
             FindNext => "Find Next",
             FindPrev => "Find Previous",
@@ -175,7 +177,7 @@ impl Cmd {
         use Cmd::*;
         &[
             NewFile, OpenFile, OpenFolder, AddFolder, Save, SaveAs, SaveAll, CloseTab, GotoAnything, GotoLine,
-            Find, Replace, ToggleSidebar, ToggleMinimap, SelectTheme, SetSyntax, PasteFromHistory,
+            Find, FindInFiles, Replace, ToggleSidebar, ToggleMinimap, SelectTheme, SetSyntax, PasteFromHistory,
             ZoomIn, ZoomOut, ZoomReset, ToggleCamelHumps, ToggleIndentation, ToggleLineEndings,
             Undo, Redo, SelectAll, SelectLine, ExpandSelection, ShrinkSelection,
             SelectNextOccurrence, UnselectOccurrence, SelectAllOccurrences, SplitIntoLines,
@@ -215,6 +217,7 @@ const BINDINGS: &[B] = &[
     B(Cmd::GotoAnything, C | S, Key::N),        // IntelliJ "Go to File"
     B(Cmd::GotoLine, C, Key::G),
     B(Cmd::Find, C, Key::F),
+    B(Cmd::FindInFiles, C | S, Key::F),          // IntelliJ / Sublime
     B(Cmd::Replace, C, Key::H),
     B(Cmd::Replace, C, Key::R),                 // IntelliJ
     B(Cmd::FindNext, 0, Key::F3),

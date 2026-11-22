@@ -5,6 +5,7 @@ mod diff;
 mod diffview;
 mod doc;
 mod editor;
+mod findfiles;
 mod highlight;
 mod icon;
 mod keymap;

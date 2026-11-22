@@ -5,10 +5,11 @@ use crate::diffview::{self, DiffState};
 use crate::editor::{self, Settings, View};
 use crate::highlight::{config_dir, lerp, Colors, LineCache, Syntax};
 use crate::keymap::{self, Cmd};
+use crate::findfiles;
 use crate::search;
 use crate::selection::Sel;
 use crate::session::{self, FileState, Session};
-use crate::text::line_text;
+use crate::text::{line_end, line_text};
 use crate::watch::{self, FsWatch};
 use eframe::egui::{
     self, text::LayoutJob, vec2, Align2, Color32, Event, FontData, FontDefinitions, FontFamily,
@@ -74,6 +75,25 @@ struct Find {
     key: Option<(u64, u64, String, bool, bool, bool)>,
     focus: bool,
     origin: usize,
+}
+
+/// Find in Files panel (Ctrl+Shift+F).
+#[derive(Default)]
+struct Fif {
+    open: bool,
+    q: findfiles::Query,
+    focus: bool,
+    search: Option<findfiles::Search>,
+    results: Vec<findfiles::FileHits>,
+    lines: usize,
+    /// Files searched and whether the result limit was hit, once finished.
+    done: Option<(usize, bool)>,
+    error: Option<String>,
+    /// Query changed at this time; searched after a short pause in typing.
+    dirty_at: Option<f64>,
+    /// Selected result: (file index, hit index).
+    sel: Option<(usize, usize)>,
+    scroll_to_sel: bool,
 }
 
 enum TreeAction {
@@ -144,6 +164,7 @@ pub struct App {
     fs: FsWatch,
     /// When the Go to File list went stale (re-walked after 0.5s without changes).
     files_stale: Option<f64>,
+    fif: Fif,
 }
 
 impl App {
@@ -199,6 +220,7 @@ impl App {
             backed_up: HashMap::new(),
             fs: FsWatch::new(cc.egui_ctx.clone()),
             files_stale: None,
+            fif: Fif::default(),
         };
         let session = Session::load();
         let had_session = session.is_some();
@@ -719,6 +741,17 @@ impl App {
                 self.find.replace = cmd == Replace;
                 self.find.focus = true;
                 self.find.key = None;
+            }
+            FindInFiles => {
+                // IntelliJ: the selected text (one line) becomes the query
+                let doc = &self.tabs[self.active].doc;
+                let s = doc.primary_sel();
+                if !s.is_empty() && doc.rope.char_to_line(s.start()) == doc.rope.char_to_line(s.end()) {
+                    self.fif.q.text = doc.rope.slice(s.start()..s.end()).to_string();
+                }
+                self.fif.open = true;
+                self.fif.focus = true;
+                self.fif.dirty_at = Some(0.0);
             }
             FindNext => self.find_step(true),
             FindPrev => self.find_step(false),
@@ -1437,6 +1470,276 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------ find in files
+
+    /// Start a pending search after a pause in typing, and collect streamed results.
+    fn fif_pump(&mut self, ctx: &egui::Context) {
+        if let Some(t) = self.fif.dirty_at {
+            let now = ctx.input(|i| i.time);
+            if now - t >= 0.25 {
+                self.fif.dirty_at = None;
+                self.fif_start(ctx);
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(0.26 - (now - t)));
+            }
+        }
+        let Some(s) = &self.fif.search else { return };
+        while let Ok(m) = s.rx.try_recv() {
+            match m {
+                findfiles::Msg::File(f) => {
+                    self.fif.lines += f.hits.len();
+                    self.fif.results.push(f);
+                    if self.fif.sel.is_none() {
+                        self.fif.sel = Some((0, 0));
+                    }
+                }
+                findfiles::Msg::Done(n, truncated) => self.fif.done = Some((n, truncated)),
+            }
+        }
+        if self.fif.done.is_some() {
+            self.fif.search = None;
+        }
+    }
+
+    fn fif_start(&mut self, ctx: &egui::Context) {
+        let f = &mut self.fif;
+        (f.search, f.done, f.error, f.sel, f.lines) = (None, None, None, None, 0);
+        f.results.clear();
+        if f.q.text.is_empty() {
+            return;
+        }
+        // all files in the sidebar folders, plus open files outside them
+        let mut files = self.files.clone();
+        let known: HashSet<&PathBuf> = self.files.iter().collect();
+        let extra: Vec<PathBuf> =
+            self.tabs.iter().filter_map(|t| t.doc.path.clone()).filter(|p| !known.contains(p)).collect();
+        files.extend(extra);
+        // unsaved edits are searched as they are in the editor, not as saved
+        let buffers = self
+            .tabs
+            .iter()
+            .filter(|t| t.doc.is_dirty())
+            .filter_map(|t| Some((t.doc.path.clone()?, t.doc.rope.to_string())))
+            .collect();
+        match findfiles::start(files, buffers, &self.fif.q, ctx.clone()) {
+            Ok(s) => self.fif.search = Some(s),
+            Err(e) => self.fif.error = Some(e),
+        }
+    }
+
+    /// Open the file of result (fi, hi) and select the match.
+    fn fif_open(&mut self, fi: usize, hi: usize) {
+        let Some((path, line, cols)) =
+            self.fif.results.get(fi).and_then(|f| f.hits.get(hi).map(|h| (f.path.clone(), h.line, h.cols)))
+        else {
+            return;
+        };
+        self.fif.sel = Some((fi, hi));
+        self.open_path(&path);
+        let tab = self.cur();
+        if tab.doc.path.as_deref() != Some(path.as_path()) {
+            return;
+        }
+        let r = &tab.doc.rope;
+        let l = line.min(r.len_lines() - 1);
+        let (start, end) = (r.line_to_char(l), line_end(r, l));
+        let (a, b) = ((start + cols.0).min(end), (start + cols.1).min(end));
+        tab.doc.set_sels(vec![Sel::new(a, b)], 0);
+        tab.view.scroll_to_caret = true;
+    }
+
+    fn fif_step(&mut self, forward: bool) {
+        let r = &self.fif.results;
+        if r.is_empty() {
+            return;
+        }
+        let (mut fi, mut hi) = self.fif.sel.unwrap_or((0, 0));
+        if forward {
+            if hi + 1 < r[fi].hits.len() {
+                hi += 1;
+            } else if fi + 1 < r.len() {
+                (fi, hi) = (fi + 1, 0);
+            }
+        } else if hi > 0 {
+            hi -= 1;
+        } else if fi > 0 {
+            fi -= 1;
+            hi = r[fi].hits.len() - 1;
+        }
+        self.fif.sel = Some((fi, hi));
+        self.fif.scroll_to_sel = true;
+    }
+
+    fn fif_panel(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        let qid = Id::new("fif_query");
+        let mid = Id::new("fif_mask");
+        if ctx.memory(|m| m.has_focus(qid) || m.has_focus(mid)) {
+            let (esc, enter, up, down) = ctx.input_mut(|i| {
+                (
+                    i.consume_key(Modifiers::NONE, Key::Escape),
+                    i.consume_key(Modifiers::NONE, Key::Enter),
+                    i.consume_key(Modifiers::NONE, Key::ArrowUp),
+                    i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                )
+            });
+            if esc {
+                self.fif.open = false;
+                self.focus_editor(ctx);
+                return;
+            }
+            if up || down {
+                self.fif_step(down);
+            }
+            if enter {
+                if let Some((fi, hi)) = self.fif.sel {
+                    self.fif_open(fi, hi);
+                    self.focus_editor(ctx);
+                }
+            }
+        }
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            ui.label("Find in Files:");
+            let r = ui.add(
+                TextEdit::singleline(&mut self.fif.q.text)
+                    .id(qid)
+                    .desired_width(300.0)
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text("↑↓ select   Enter: open   Esc: close"),
+            );
+            if self.fif.focus {
+                r.request_focus();
+                select_all_text(ctx, qid, &self.fif.q.text);
+                self.fif.focus = false;
+            }
+            changed |= r.changed();
+            changed |= ui.toggle_value(&mut self.fif.q.case, "Aa").on_hover_text("Match case").changed();
+            changed |= ui.toggle_value(&mut self.fif.q.whole, "W").on_hover_text("Whole words").changed();
+            changed |= ui.toggle_value(&mut self.fif.q.regex, ".*").on_hover_text("Regular expression").changed();
+            ui.label("Files:");
+            changed |= ui
+                .add(TextEdit::singleline(&mut self.fif.q.mask).id(mid).desired_width(130.0).hint_text("*.rs, !*.lock"))
+                .on_hover_text("File name masks, comma separated; ! excludes")
+                .changed();
+            let status = if let Some(e) = &self.fif.error {
+                RichText::new(e).color(Color32::from_rgb(0xe0, 0x6c, 0x75))
+            } else if self.fif.q.text.is_empty() {
+                RichText::new(if self.roots.is_empty() { "Searches open files (add a folder to search it)" } else { "" })
+            } else {
+                let (n, files) = (self.fif.lines, self.fif.results.len());
+                let found = format!("{n} line{} in {files} file{}", if n == 1 { "" } else { "s" }, if files == 1 { "" } else { "s" });
+                RichText::new(match self.fif.done {
+                    None => format!("Searching… {found}"),
+                    Some((_, true)) => format!("{found} (stopped at {} lines)", findfiles::MAX_LINES),
+                    Some((searched, false)) if n == 0 => format!("No matches in {searched} files"),
+                    Some(_) => found,
+                })
+                .weak()
+            };
+            ui.label(status);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("×").on_hover_text("Close (Esc)").clicked() {
+                    self.fif.open = false;
+                }
+            });
+        });
+        if changed {
+            self.fif.dirty_at = Some(ctx.input(|i| i.time));
+        }
+        ui.add_space(4.0);
+
+        // results: a flat list of rows (file headers and matching lines), drawn lazily
+        let rows: Vec<(usize, Option<usize>)> = self
+            .fif
+            .results
+            .iter()
+            .enumerate()
+            .flat_map(|(fi, f)| std::iter::once((fi, None)).chain((0..f.hits.len()).map(move |hi| (fi, Some(hi)))))
+            .collect();
+        let mono = FontId::monospace(self.settings.font_size - 1.0);
+        let row_h = ui.fonts(|f| f.row_height(&mono)) + 4.0;
+        let c = self.colors.clone();
+        let sel_row = self.fif.sel.and_then(|s| rows.iter().position(|&(fi, hi)| (fi, hi) == (s.0, Some(s.1))));
+        let mut scroll = egui::ScrollArea::vertical().id_salt("fif_results").auto_shrink([false, false]);
+        if std::mem::take(&mut self.fif.scroll_to_sel) {
+            if let Some(i) = sel_row {
+                // keep the selected row inside the visible part of the list
+                let step = row_h + ui.spacing().item_spacing.y;
+                let (top, view_h) = (i as f32 * step, ui.available_height());
+                let sid = ui.make_persistent_id("fif_results");
+                let offset = egui::scroll_area::State::load(ctx, sid).map_or(0.0, |s| s.offset.y);
+                if top < offset {
+                    scroll = scroll.vertical_scroll_offset(top);
+                } else if top + step > offset + view_h {
+                    scroll = scroll.vertical_scroll_offset(top + step - view_h);
+                }
+            }
+        }
+        let mut clicked = None;
+        scroll.show_rows(ui, row_h, rows.len(), |ui, range| {
+            for i in range {
+                let (fi, hi) = rows[i];
+                let f = &self.fif.results[fi];
+                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
+                let p = ui.painter();
+                match hi {
+                    None => {
+                        let name = f.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        let dir = self.rel(&f.path);
+                        let dir = dir.strip_suffix(&name).unwrap_or(&dir).trim_end_matches('/');
+                        let mut job = LayoutJob::default();
+                        let ui_font = FontId::proportional(self.settings.font_size - 1.0);
+                        job.append(&name, 0.0, TextFormat { font_id: ui_font.clone(), color: c.fg, ..Default::default() });
+                        job.append(&format!("  {dir}"), 0.0, TextFormat { font_id: ui_font.clone(), color: c.gutter_fg, ..Default::default() });
+                        job.append(&format!("  {}", f.hits.len()), 0.0, TextFormat { font_id: ui_font, color: c.gutter_fg, ..Default::default() });
+                        let g = ui.fonts(|fo| fo.layout_job(job));
+                        p.galley(egui::pos2(rect.left() + 4.0, rect.center().y - g.size().y / 2.0), g, c.fg);
+                    }
+                    Some(hi) => {
+                        let h = &f.hits[hi];
+                        if Some(i) == sel_row {
+                            p.rect_filled(rect, 3.0, c.selection);
+                        } else if resp.hovered() {
+                            p.rect_filled(rect, 3.0, c.line_hl);
+                        }
+                        p.text(
+                            egui::pos2(rect.left() + 54.0, rect.center().y),
+                            Align2::RIGHT_CENTER,
+                            (h.line + 1).to_string(),
+                            mono.clone(),
+                            c.gutter_fg,
+                        );
+                        let mut job = LayoutJob::default();
+                        let mut at = 0;
+                        let plain = TextFormat { font_id: mono.clone(), color: c.fg, ..Default::default() };
+                        let hit = TextFormat { background: c.find, ..plain.clone() };
+                        for &(s, e) in &h.ranges {
+                            job.append(&h.preview[at..s], 0.0, plain.clone());
+                            job.append(&h.preview[s..e], 0.0, hit.clone());
+                            at = e;
+                        }
+                        job.append(&h.preview[at..], 0.0, plain);
+                        let g = ui.fonts(|fo| fo.layout_job(job));
+                        let clip = rect.intersect(ui.clip_rect());
+                        ui.painter().with_clip_rect(clip).galley(
+                            egui::pos2(rect.left() + 66.0, rect.center().y - g.size().y / 2.0),
+                            g,
+                            c.fg,
+                        );
+                        if resp.clicked() {
+                            clicked = Some((fi, hi));
+                        }
+                    }
+                }
+            }
+        });
+        if let Some((fi, hi)) = clicked {
+            self.fif_open(fi, hi);
+            self.focus_editor(ctx);
+        }
+    }
+
     // ------------------------------------------------------------ external changes
 
     /// Follow changes on disk: refresh the tree and reload open files that changed.
@@ -1673,7 +1976,7 @@ impl eframe::App for App {
                     }
                 });
                 ui.menu_button("Find", |ui| {
-                    for cmd in [Cmd::Find, Cmd::Replace, Cmd::FindNext, Cmd::FindPrev, Cmd::GotoAnything, Cmd::GotoLine, Cmd::GotoBracket] {
+                    for cmd in [Cmd::Find, Cmd::FindInFiles, Cmd::Replace, Cmd::FindNext, Cmd::FindPrev, Cmd::GotoAnything, Cmd::GotoLine, Cmd::GotoBracket] {
                         item(ui, cmd, self);
                     }
                 });
@@ -1850,6 +2153,16 @@ impl eframe::App for App {
                 });
             });
         });
+
+        // ---------------- find in files
+        self.fif_pump(ctx);
+        if self.fif.open {
+            egui::TopBottomPanel::bottom("find_in_files")
+                .resizable(true)
+                .default_height(260.0)
+                .frame(Frame::none().fill(c.panel).inner_margin(Margin::symmetric(4.0, 6.0)))
+                .show(ctx, |ui| self.fif_panel(ctx, ui));
+        }
 
         // ---------------- find bar
         if self.find.open {

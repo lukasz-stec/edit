@@ -29,7 +29,7 @@ Pass files or a folder on the command line: `edit path/to/project path/to/file.r
   of 100+ languages; large files stay responsive.
 - **Sublime basics**: tabs, a sidebar with one or more folders (File › Add Folder),
   Go to Anything (fuzzy file finder),
-  command palette, find/replace with regex, minimap.
+  command palette, find/replace with regex, Find in Files across all folders, minimap.
 - **IntelliJ editing**: CamelHumps word movement (`Ctrl+←/→` stops inside `camelCase`
   and `snake_case` words), Extend/Shrink Selection, Start New Line, Join Lines,
   Move Line, Toggle Case, clipboard history.
@@ -63,6 +63,7 @@ On macOS, `Cmd` works wherever `Ctrl` is listed.
 | `Ctrl+Tab`, `Ctrl+PageDown` / `Ctrl+Shift+Tab`, `Ctrl+PageUp` | Next / previous tab |
 | `Alt+1` | Toggle sidebar |
 | `Ctrl+F` / `Ctrl+H`, `Ctrl+R` | Find / replace |
+| `Ctrl+Shift+F` | Find in Files (all sidebar folders; ↑↓ and Enter to open a result) |
 | `F3` / `Shift+F3` | Next / previous match |
 | `Ctrl+M`, `Ctrl+Shift+M` | Go to matching bracket |
 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Zoom in / out / reset |
