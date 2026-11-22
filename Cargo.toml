@@ -10,6 +10,8 @@ ropey = "1.6"
 syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
 regex = "1"
 rfd = "0.15"
+similar = "2"
+arboard = "3"
 
 [profile.release]
 opt-level = 3

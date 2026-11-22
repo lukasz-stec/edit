@@ -34,6 +34,15 @@ pub enum Cmd {
     ToggleIndentation,
     ToggleLineEndings,
     ToggleColumnMode,
+    DiffWithSaved,
+    DiffWithHead,
+    DiffWithClipboard,
+    DiffWithFile,
+    DiffWithTab,
+    DiffTreeSelection,
+    CloseDiff,
+    NextDiff,
+    PrevDiff,
     Quit,
     // ---- editor
     Undo,
@@ -80,6 +89,8 @@ impl Cmd {
                 | CommandPalette | GotoAnything | GotoLine | Find | Replace | FindNext | FindPrev
                 | ToggleSidebar | ToggleMinimap | SelectTheme | SetSyntax | PasteFromHistory | ZoomIn
                 | ZoomOut | ZoomReset | ToggleCamelHumps | ToggleIndentation | ToggleLineEndings | ToggleColumnMode | Quit
+                | DiffWithSaved | DiffWithHead | DiffWithClipboard | DiffWithFile | DiffWithTab | DiffTreeSelection | CloseDiff
+                | NextDiff | PrevDiff
         )
     }
 
@@ -114,6 +125,15 @@ impl Cmd {
             ToggleIndentation => "Indentation: Toggle Tabs / Spaces",
             ToggleLineEndings => "Line Endings: Toggle LF / CRLF",
             ToggleColumnMode => "Selection: Column Selection Mode (IntelliJ)",
+            DiffWithSaved => "Diff: Compare with Saved File",
+            DiffWithHead => "Diff: Compare with Git HEAD",
+            DiffWithClipboard => "Diff: Compare with Clipboard",
+            DiffWithFile => "Diff: Compare with File…",
+            DiffWithTab => "Diff: Compare with Open Tab…",
+            DiffTreeSelection => "Diff: Compare Files Selected in Sidebar",
+            CloseDiff => "Diff: Close Diff",
+            NextDiff => "Diff: Next Difference",
+            PrevDiff => "Diff: Previous Difference",
             Quit => "Quit",
             Undo => "Edit: Undo",
             Redo => "Edit: Redo",
@@ -158,6 +178,8 @@ impl Cmd {
             AddCaretAbove, AddCaretBelow, CaretsAtLineEnds, ToggleColumnMode, Duplicate, DeleteLine, MoveLineUp, MoveLineDown,
             ToggleComment, Indent, Outdent, JoinLines, SortLines, ToggleCase, InsertLineBelow,
             InsertLineAbove, GotoBracket, NextTab, PrevTab, Quit,
+            DiffWithSaved, DiffWithHead, DiffWithClipboard, DiffWithFile, DiffWithTab, DiffTreeSelection, CloseDiff,
+            NextDiff, PrevDiff,
         ]
     }
 }
@@ -193,6 +215,8 @@ const BINDINGS: &[B] = &[
     B(Cmd::Replace, C, Key::R),                 // IntelliJ
     B(Cmd::FindNext, 0, Key::F3),
     B(Cmd::FindPrev, S, Key::F3),
+    B(Cmd::NextDiff, 0, Key::F7),               // IntelliJ
+    B(Cmd::PrevDiff, S, Key::F7),               // IntelliJ
     B(Cmd::ToggleSidebar, A, Key::Num1),        // IntelliJ project tool window
     B(Cmd::PasteFromHistory, C | S, Key::V),    // IntelliJ clipboard history
     B(Cmd::ZoomIn, C, Key::Equals),

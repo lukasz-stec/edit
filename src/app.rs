@@ -1,6 +1,7 @@
 //! Application shell: tabs, sidebar, command palette, find bar, dialogs.
 
 use crate::doc::{Document, EditKind, Motion};
+use crate::diffview::{self, DiffState};
 use crate::editor::{self, Settings, View};
 use crate::highlight::{config_dir, lerp, Colors, LineCache, Syntax};
 use crate::keymap::{self, Cmd};
@@ -19,6 +20,8 @@ use std::path::{Path, PathBuf};
 pub struct Tab {
     pub doc: Document,
     pub view: View,
+    /// Side-by-side diff shown instead of the plain editor (the right side is `doc`).
+    pub diff: Option<DiffState>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -28,6 +31,7 @@ enum PMode {
     Themes,
     Syntaxes,
     Clipboard,
+    DiffTab,
 }
 
 #[derive(Clone)]
@@ -38,6 +42,7 @@ enum PAction {
     Theme(String),
     Syntax(String),
     Clip(usize),
+    DiffTab(usize),
 }
 
 struct PItem {
@@ -68,6 +73,13 @@ struct Find {
     key: Option<(u64, u64, String, bool, bool, bool)>,
     focus: bool,
     origin: usize,
+}
+
+enum TreeAction {
+    /// Diff two files: (left, right). The right one is opened as the editable side.
+    Compare(PathBuf, PathBuf),
+    /// Diff a file against the active editor.
+    CompareWithActive(PathBuf),
 }
 
 enum Pending {
@@ -103,9 +115,17 @@ pub struct App {
     allow_quit: bool,
     title: String,
     editor_id: Id,
+    diff_left_id: Id,
+    /// The read-only left pane of a diff had keyboard focus when input was dispatched.
+    left_focus: bool,
     status: Option<(String, f64)>,
     camel_humps: bool,
     to_open: Option<PathBuf>,
+    /// Files selected in the sidebar tree (Ctrl+click adds), oldest first.
+    tree_sel: Vec<PathBuf>,
+    tree_action: Option<TreeAction>,
+    /// Active file the tree selection last followed.
+    tree_followed: Option<PathBuf>,
     /// Last session text written to disk, and when.
     session_text: String,
     session_saved_at: f64,
@@ -133,7 +153,7 @@ impl App {
         let colors = Colors::from_theme(syn.theme(&theme_name));
         let plain = syn.ss.find_syntax_plain_text().name.clone();
         let mut app = Self {
-            tabs: vec![Tab { doc: Document::new(), view: View::new(plain) }],
+            tabs: vec![Tab { doc: Document::new(), view: View::new(plain), diff: None }],
             active: 0,
             syn,
             theme_name,
@@ -152,9 +172,14 @@ impl App {
             allow_quit: false,
             title: String::new(),
             editor_id: Id::new("editor"),
+            diff_left_id: Id::new("diff_left"),
+            left_focus: false,
             status: None,
             camel_humps: true,
             to_open: None,
+            tree_sel: vec![],
+            tree_action: None,
+            tree_followed: None,
             session_text: String::new(),
             session_saved_at: 0.0,
             startup_focus: false,
@@ -214,7 +239,7 @@ impl App {
                     doc.load_backup(&text, f.crlf);
                     let first = line_text(&doc.rope, 0);
                     let syntax = self.syn.detect(path.as_deref(), &first);
-                    self.push_tab(Tab { doc, view: View::new(syntax) });
+                    self.push_tab(Tab { doc, view: View::new(syntax), diff: None });
                     unsaved += 1;
                 }
                 // clean file (or its backup is gone): reload from disk
@@ -350,7 +375,7 @@ impl App {
         let plain = self.syn.ss.find_syntax_plain_text().name.clone();
         let mut doc = Document::new();
         doc.camel_humps = self.camel_humps;
-        self.tabs.push(Tab { doc, view: View::new(plain) });
+        self.tabs.push(Tab { doc, view: View::new(plain), diff: None });
         self.active = self.tabs.len() - 1;
     }
 
@@ -370,7 +395,7 @@ impl App {
                 doc.camel_humps = self.camel_humps;
                 let first = if doc.rope.len_lines() > 0 { line_text(&doc.rope, 0) } else { String::new() };
                 let syntax = self.syn.detect(Some(p), &first);
-                self.push_tab(Tab { doc, view: View::new(syntax) });
+                self.push_tab(Tab { doc, view: View::new(syntax), diff: None });
             }
             Err(e) => self.status = Some((format!("Cannot open {}: {e}", p.display()), 0.0)),
         }
@@ -390,6 +415,8 @@ impl App {
     fn set_root(&mut self, dir: PathBuf) {
         let dir = std::path::absolute(&dir).unwrap_or(dir);
         self.dir_cache.clear();
+        self.tree_sel.clear();
+        self.tree_followed = None;
         self.files = walk(&dir, 50_000);
         self.root = Some(dir);
         self.sidebar = true;
@@ -529,6 +556,9 @@ impl App {
     }
 
     fn run(&mut self, ctx: &egui::Context, a: Action) {
+        if self.left_focus && self.tabs[self.active].diff.is_some() {
+            return self.run_left(ctx, a);
+        }
         if self.block_action(ctx, &a) {
             return;
         }
@@ -551,6 +581,14 @@ impl App {
                 if cmd == Cmd::Escape && self.find.open {
                     self.find.open = false;
                     return;
+                }
+                {
+                    // IntelliJ: Esc closes the diff (once there's nothing left to collapse)
+                    let t = &mut self.tabs[self.active];
+                    if cmd == Cmd::Escape && t.diff.is_some() && t.doc.sels.len() == 1 && t.doc.primary_sel().is_empty() {
+                        t.diff = None;
+                        return;
+                    }
                 }
                 let doc = &mut self.tabs[self.active].doc;
                 use Cmd::*;
@@ -670,6 +708,34 @@ impl App {
                 let d = &mut self.tabs[self.active].doc;
                 d.use_tabs = !d.use_tabs;
             }
+            DiffWithSaved | DiffWithHead | DiffWithClipboard | DiffWithFile => {
+                if let Some((text, title)) = self.diff_source(cmd) {
+                    self.open_diff(ctx, text, title);
+                }
+            }
+            DiffTreeSelection => match self.tree_pair() {
+                Some((a, b)) => self.run_tree_action(ctx, TreeAction::Compare(a, b)),
+                None => self.set_status(ctx, "Ctrl+click two files in the sidebar first"),
+            },
+            DiffWithTab => {
+                if self.tabs.len() > 1 {
+                    self.open_palette(PMode::DiffTab, "");
+                } else {
+                    self.set_status(ctx, "Open another tab to compare with");
+                }
+            }
+            CloseDiff => {
+                self.tabs[self.active].diff = None;
+                self.focus_editor(ctx);
+            }
+            NextDiff | PrevDiff => {
+                let left_focus = self.left_focus;
+                let t = &mut self.tabs[self.active];
+                match t.diff.as_mut() {
+                    Some(d) => d.navigate(&mut t.doc, &mut t.view, cmd == NextDiff, left_focus),
+                    None => self.set_status(ctx, "Open a diff first (Diff menu)"),
+                }
+            }
             ToggleColumnMode => {
                 let t = &mut self.tabs[self.active];
                 t.doc.toggle_column_mode();
@@ -688,7 +754,9 @@ impl App {
     // ------------------------------------------------------------ keyboard dispatch
 
     fn handle_input(&mut self, ctx: &egui::Context) {
-        let editor_focused = ctx.memory(|m| m.has_focus(self.editor_id));
+        let left_focused = self.tabs[self.active].diff.is_some() && ctx.memory(|m| m.has_focus(self.diff_left_id));
+        self.left_focus = left_focused;
+        let editor_focused = left_focused || ctx.memory(|m| m.has_focus(self.editor_id));
         let modal = self.palette.is_some() || self.pending.is_some();
         let events = ctx.input(|i| i.events.clone());
         let mut keep = Vec::with_capacity(events.len());
@@ -923,7 +991,7 @@ impl App {
             }
             ui.toggle_value(&mut self.find.replace, "Replace…");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("✕").clicked() {
+                if ui.button("×").clicked() {
                     self.find.open = false;
                 }
             });
@@ -1019,6 +1087,14 @@ impl App {
                     push(first, d, PAction::Clip(i), query);
                 }
             }
+            PMode::DiffTab => {
+                for (i, t) in self.tabs.iter().enumerate() {
+                    if i != self.active {
+                        let d = t.doc.path.as_ref().map(|p| self.rel(p)).unwrap_or_default();
+                        push(t.doc.name(), d, PAction::DiffTab(i), query);
+                    }
+                }
+            }
         }
         if !query.is_empty() && mode != PMode::Clipboard {
             items.sort_by(|a, b| b.0.cmp(&a.0));
@@ -1070,6 +1146,7 @@ impl App {
             PMode::Themes => "Select color theme…",
             PMode::Syntaxes => "Set syntax…",
             PMode::Clipboard => "Paste from history…",
+            PMode::DiffTab => "Compare with tab…",
         };
         let colors = self.colors.clone();
         egui::Area::new(Id::new("palette"))
@@ -1171,6 +1248,145 @@ impl App {
                     self.run(ctx, Action::Paste(t));
                 }
             }
+            PAction::DiffTab(i) => {
+                if let Some(t) = self.tabs.get(i) {
+                    let (text, title) = (t.doc.rope.to_string(), format!("Tab: {}", t.doc.name()));
+                    self.open_diff(ctx, Ok(text), title);
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ diff
+
+    /// The two most recently selected files in the tree, if at least two are selected.
+    fn tree_pair(&self) -> Option<(PathBuf, PathBuf)> {
+        let n = self.tree_sel.len();
+        (n >= 2).then(|| (self.tree_sel[n - 2].clone(), self.tree_sel[n - 1].clone()))
+    }
+
+    /// Text of a file, preferring an open tab's buffer (so unsaved edits are compared).
+    fn file_text(&self, p: &Path) -> Result<String, String> {
+        if let Some(t) = self.tabs.iter().find(|t| t.doc.path.as_deref() == Some(p)) {
+            return Ok(t.doc.rope.to_string());
+        }
+        std::fs::read(p)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .map_err(|e| format!("Cannot read {}: {e}", p.display()))
+    }
+
+    fn run_tree_action(&mut self, ctx: &egui::Context, a: TreeAction) {
+        match a {
+            TreeAction::Compare(left, right) => {
+                let text = self.file_text(&left);
+                if let Err(e) = text {
+                    return self.set_status(ctx, e);
+                }
+                self.open_path(&right);
+                if self.tabs[self.active].doc.path.as_deref() != Some(right.as_path()) {
+                    return; // couldn't open (status already set)
+                }
+                let title = format!("File: {}", self.rel(&left));
+                self.open_diff(ctx, text, title);
+            }
+            TreeAction::CompareWithActive(p) => {
+                let title = format!("File: {}", self.rel(&p));
+                let text = self.file_text(&p);
+                self.open_diff(ctx, text, title);
+            }
+        }
+    }
+
+    fn open_diff(&mut self, ctx: &egui::Context, left: Result<String, String>, title: String) {
+        match left {
+            Ok(text) => {
+                let tab = &mut self.tabs[self.active];
+                tab.diff = Some(DiffState::new(&text, title, &tab.doc, &tab.view));
+                self.find.open = false;
+                self.focus_editor(ctx);
+            }
+            Err(e) => self.set_status(ctx, e),
+        }
+    }
+
+    fn diff_source(&mut self, cmd: Cmd) -> Option<(Result<String, String>, String)> {
+        let doc = &self.tabs[self.active].doc;
+        let read = |p: &Path| std::fs::read(p).map(|b| String::from_utf8_lossy(&b).into_owned()).map_err(|e| e.to_string());
+        Some(match cmd {
+            Cmd::DiffWithSaved => match &doc.path {
+                Some(p) => (read(p).map_err(|e| format!("Cannot read saved file: {e}")), format!("Saved: {}", doc.name())),
+                None => (Err("This buffer has never been saved".into()), String::new()),
+            },
+            Cmd::DiffWithHead => match &doc.path {
+                Some(p) => (git_head_text(p), format!("Git HEAD: {}", doc.name())),
+                None => (Err("This buffer is not a file".into()), String::new()),
+            },
+            Cmd::DiffWithClipboard => (
+                arboard::Clipboard::new()
+                    .and_then(|mut c| c.get_text())
+                    .map_err(|e| format!("Clipboard has no text: {e}")),
+                "Clipboard".into(),
+            ),
+            Cmd::DiffWithFile => {
+                let p = rfd::FileDialog::new().pick_file()?;
+                let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                (read(&p), format!("File: {name}"))
+            }
+            _ => return None,
+        })
+    }
+
+    /// Route input to the read-only left pane of a diff.
+    fn run_left(&mut self, ctx: &egui::Context, a: Action) {
+        if let Action::Cmd(cmd) = a {
+            if cmd.is_global() {
+                return self.run_global(ctx, cmd);
+            }
+        }
+        let page = self.tabs[self.active].view.page_lines;
+        let Some(d) = self.tabs[self.active].diff.as_mut() else { return };
+        let doc = &mut d.left;
+        let mut close = false;
+        let mut clip = None;
+        let mut read_only = false;
+        match a {
+            Action::Copy | Action::Cut => clip = Some(doc.copy()),
+            Action::Cmd(cmd) => {
+                use Cmd::*;
+                match cmd {
+                    Move(m, ext) => {
+                        let m = match m {
+                            Motion::PageUp(_) => Motion::PageUp(page),
+                            Motion::PageDown(_) => Motion::PageDown(page),
+                            m => m,
+                        };
+                        doc.move_sels(m, ext);
+                    }
+                    SelectAll => doc.select_all(),
+                    SelectLine => doc.select_line(),
+                    ExpandSelection => doc.expand_selection(),
+                    ShrinkSelection => doc.shrink_selection(),
+                    SelectNextOccurrence => doc.select_next_occurrence(),
+                    SelectAllOccurrences => doc.select_all_occurrences(),
+                    AddCaretAbove => doc.add_caret(true),
+                    AddCaretBelow => doc.add_caret(false),
+                    Escape if doc.sels.len() > 1 || !doc.primary_sel().is_empty() => doc.single_selection(),
+                    Escape => close = true,
+                    _ => read_only = true,
+                }
+            }
+            Action::Text(_) | Action::Paste(_) => read_only = true,
+        }
+        d.left_view.scroll_to_caret = true;
+        if let Some((t, line)) = clip {
+            self.store_clip(ctx, t, line);
+        }
+        if close {
+            self.tabs[self.active].diff = None;
+            self.focus_editor(ctx);
+        }
+        if read_only {
+            self.set_status(ctx, "The left side of the diff is read-only");
         }
     }
 
@@ -1187,11 +1403,56 @@ impl App {
                     .show(ui, |ui| self.tree_ui(ui, &path, active));
             } else {
                 let is_active = active == Some(path.as_path());
-                let r = ui.add(egui::SelectableLabel::new(is_active, RichText::new(&name)));
-                if r.clicked() {
-                    self.to_open = Some(path.clone());
+                let selected = self.tree_sel.contains(&path);
+                let mut text = RichText::new(&name);
+                if selected && self.tree_sel.len() > 1 {
+                    text = text.strong().underline();
                 }
-                r.on_hover_text(path.to_string_lossy());
+                let r = ui.add(egui::SelectableLabel::new(selected || (is_active && self.tree_sel.len() <= 1), text));
+                if r.clicked() {
+                    if ui.input(|i| i.modifiers.ctrl || i.modifiers.command) {
+                        // Ctrl+click: multi-select (like IntelliJ's Project view)
+                        if let Some(i) = self.tree_sel.iter().position(|p| p == &path) {
+                            if self.tree_sel.len() > 1 {
+                                self.tree_sel.remove(i);
+                            }
+                        } else {
+                            self.tree_sel.push(path.clone());
+                        }
+                        if self.tree_sel.len() == 2 {
+                            self.status = Some(("2 files selected — right-click › Compare Selected Files".into(), 0.0));
+                        }
+                    } else {
+                        self.tree_sel = vec![path.clone()];
+                        self.to_open = Some(path.clone());
+                    }
+                }
+                let r = r.on_hover_text(path.to_string_lossy());
+                r.context_menu(|ui| {
+                    // right-clicking outside the selection acts on that file alone
+                    if !self.tree_sel.contains(&path) {
+                        self.tree_sel = vec![path.clone()];
+                    }
+                    let pair = self.tree_pair();
+                    let label = match &pair {
+                        Some((a, b)) => format!("Compare Selected Files ({} ↔ {})", file_name(a), file_name(b)),
+                        None => "Compare Selected Files (Ctrl+click two files)".into(),
+                    };
+                    if ui.add_enabled(pair.is_some(), egui::Button::new(label)).clicked() {
+                        self.tree_action = pair.map(|(a, b)| TreeAction::Compare(a, b));
+                        ui.close_menu();
+                    }
+                    let can_active = active.is_some_and(|a| a != path.as_path());
+                    if ui.add_enabled(can_active, egui::Button::new("Compare with Active File")).clicked() {
+                        self.tree_action = Some(TreeAction::CompareWithActive(path.clone()));
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Open").clicked() {
+                        self.to_open = Some(path.clone());
+                        ui.close_menu();
+                    }
+                });
             }
         }
     }
@@ -1297,6 +1558,11 @@ impl eframe::App for App {
                         item(ui, cmd, self);
                     }
                 });
+                ui.menu_button("Diff", |ui| {
+                    for cmd in [Cmd::DiffWithSaved, Cmd::DiffWithHead, Cmd::DiffWithClipboard, Cmd::DiffWithFile, Cmd::DiffWithTab, Cmd::DiffTreeSelection, Cmd::NextDiff, Cmd::PrevDiff, Cmd::CloseDiff] {
+                        item(ui, cmd, self);
+                    }
+                });
                 ui.menu_button("View", |ui| {
                     for cmd in [Cmd::CommandPalette, Cmd::ToggleSidebar, Cmd::ToggleMinimap, Cmd::ZoomIn, Cmd::ZoomOut, Cmd::ZoomReset, Cmd::SelectTheme, Cmd::SetSyntax, Cmd::ToggleCamelHumps] {
                         item(ui, cmd, self);
@@ -1379,6 +1645,14 @@ impl eframe::App for App {
                             }
                         });
                         let active = self.tabs[self.active].doc.path.clone();
+                        // Without a multi-selection, the tree's selection follows the active
+                        // file, so Ctrl+clicking one more file selects a pair (as in IntelliJ).
+                        if self.tree_followed != active {
+                            self.tree_followed = active.clone();
+                            if self.tree_sel.len() <= 1 {
+                                self.tree_sel = active.iter().cloned().collect();
+                            }
+                        }
                         self.tree_ui(ui, &root, active.as_deref());
                     } else if ui.button("Open Folder…").clicked() {
                         self.run_global(ctx, Cmd::OpenFolder);
@@ -1389,6 +1663,9 @@ impl eframe::App for App {
         if let Some(p) = self.to_open.take() {
             self.open_path(&p);
             self.focus_editor(ctx);
+        }
+        if let Some(a) = self.tree_action.take() {
+            self.run_tree_action(ctx, a);
         }
 
         // ---------------- tabs
@@ -1444,11 +1721,35 @@ impl eframe::App for App {
         egui::CentralPanel::default().frame(Frame::none().fill(c.bg)).show(ctx, |ui| {
             let theme = self.syn.theme(&self.theme_name);
             let find: &[(usize, usize)] = if self.find.open { &self.find.matches } else { &[] };
-            let cx = editor::Ctx { syn: &self.syn, theme, colors: &self.colors, settings: &self.settings, find, id: self.editor_id };
             let tab = &mut self.tabs[self.active];
-            let resp = editor::show(ui, &mut tab.doc, &mut tab.view, &cx);
-            if std::mem::take(&mut self.startup_focus) {
-                resp.request_focus();
+            if let Some(d) = tab.diff.as_mut() {
+                let cx = diffview::Ctx {
+                    syn: &self.syn,
+                    theme,
+                    colors: &self.colors,
+                    settings: &self.settings,
+                    find,
+                    right_id: self.editor_id,
+                    left_id: self.diff_left_id,
+                };
+                if let diffview::Outcome::Close = diffview::show(ui, &mut tab.doc, &mut tab.view, d, &cx) {
+                    tab.diff = None;
+                    ui.memory_mut(|m| m.request_focus(self.editor_id));
+                }
+            } else {
+                let cx = editor::Ctx {
+                    syn: &self.syn,
+                    theme,
+                    colors: &self.colors,
+                    settings: &self.settings,
+                    find,
+                    id: self.editor_id,
+                    decor: None,
+                };
+                let resp = editor::show(ui, &mut tab.doc, &mut tab.view, &cx);
+                if std::mem::take(&mut self.startup_focus) {
+                    resp.request_focus();
+                }
             }
         });
 
@@ -1564,4 +1865,27 @@ fn setup_fonts(ctx: &egui::Context) {
         fonts.families.get_mut(&FontFamily::Proportional).unwrap().insert(0, "ui".into());
     }
     ctx.set_fonts(fonts);
+}
+
+/// Contents of `path` at Git HEAD (`git show HEAD:./name`, run from the file's folder).
+fn git_head_text(path: &Path) -> Result<String, String> {
+    let dir = path.parent().ok_or("File has no folder")?;
+    let name = path.file_name().ok_or("Not a file")?.to_string_lossy().into_owned();
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(dir).arg("show").arg(format!("HEAD:./{name}"));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console flash
+    }
+    let out = cmd.output().map_err(|e| format!("Could not run git: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("git: {}", err.lines().next().unwrap_or("file is not in HEAD").trim()));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn file_name(p: &Path) -> String {
+    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }

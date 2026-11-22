@@ -47,6 +47,9 @@ pub struct View {
     blink_sig: (u64, usize, usize),
     mm_drag: bool,
     sb_drag: Option<f32>,
+    /// Layout from the last frame (used to link the diff panes).
+    pub text_rect: Rect,
+    pub line_height: f32,
 }
 
 impl View {
@@ -63,14 +66,28 @@ impl View {
             blink_sig: (0, 0, 0),
             mm_drag: false,
             sb_drag: None,
+            text_rect: Rect::NOTHING,
+            line_height: 20.0,
         }
     }
 }
 
+#[derive(Clone)]
 pub struct Settings {
     pub font_size: f32,
     pub line_spacing: f32,
     pub minimap: bool,
+}
+
+/// Extra background decorations (used by the diff view).
+#[derive(Default)]
+pub struct Decor {
+    /// Full-width line backgrounds: (first line, end line exclusive, color).
+    pub lines: Vec<(usize, usize, Color32)>,
+    /// Char ranges painted on top of the line backgrounds (changed words).
+    pub inline: Vec<(usize, usize, Color32)>,
+    /// Thin horizontal markers at the top of a line (where the other side inserted lines).
+    pub marks: Vec<(usize, Color32)>,
 }
 
 pub struct Ctx<'a> {
@@ -80,6 +97,7 @@ pub struct Ctx<'a> {
     pub settings: &'a Settings,
     pub find: &'a [(usize, usize)],
     pub id: Id,
+    pub decor: Option<&'a Decor>,
 }
 
 const MINIMAP_W: f32 = 110.0;
@@ -109,6 +127,8 @@ pub fn show(ui: &mut Ui, doc: &mut Document, view: &mut View, cx: &Ctx) -> Respo
     let sb_rect = Rect::from_min_max(pos2(mm_rect.min.x - SB_W, rect.min.y), pos2(mm_rect.min.x, rect.max.y));
     let text_rect = Rect::from_min_max(pos2(gutter.max.x, rect.min.y), pos2(sb_rect.min.x, rect.max.y));
     let pad = cw * 0.5;
+    view.text_rect = text_rect;
+    view.line_height = lh;
     let vis_h = text_rect.height();
     view.page_lines = ((vis_h / lh) as usize).saturating_sub(1).max(1);
     let max_scroll_y = (nlines.saturating_sub(1)) as f32 * lh;
@@ -432,6 +452,30 @@ pub fn show(ui: &mut Ui, doc: &mut Document, view: &mut View, cx: &Ctx) -> Respo
             }
         }
     };
+
+    // diff decorations
+    if let Some(d) = cx.decor {
+        let row = |l: usize| Rect::from_min_size(pos2(text_rect.left(), y_of(l)), vec2(text_rect.width(), lh));
+        for &(a, b, col) in &d.lines {
+            for l in a.max(first)..b.min(last) {
+                tp.rect_filled(row(l), 0.0, col);
+            }
+        }
+        for &(a, b, col) in &d.inline {
+            if b >= first_char && a <= last_char {
+                range_rects(a, b, &mut |r| {
+                    tp.rect_filled(r, 2.0, col);
+                });
+            }
+        }
+        for &(l, col) in &d.marks {
+            if l >= first && l <= last {
+                let y = y_of(l).round() + 0.5;
+                tp.line_segment([pos2(text_rect.left(), y), pos2(text_rect.right(), y)], Stroke::new(2.0_f32, col));
+            }
+        }
+    }
+
     if let Some(b) = doc.block {
         let (l0, l1) = b.lines();
         let (c0, c1) = b.cols();
@@ -649,6 +693,14 @@ pub fn show(ui: &mut Ui, doc: &mut Document, view: &mut View, cx: &Ctx) -> Respo
         };
         for m in cx.find.iter().take(5000) {
             mark(rope.char_to_line(m.0), c.find.to_opaque());
+        }
+        if let Some(d) = cx.decor {
+            for &(a, _, col) in d.lines.iter().take(5000) {
+                mark(a, col.to_opaque());
+            }
+            for &(l, col) in d.marks.iter().take(5000) {
+                mark(l, col.to_opaque());
+            }
         }
         if doc.sels.len() < 5000 {
             for s in &doc.sels {

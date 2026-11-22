@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod diff;
+mod diffview;
 mod doc;
 mod editor;
 mod highlight;
