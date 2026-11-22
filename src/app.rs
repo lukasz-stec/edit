@@ -3,6 +3,7 @@
 use crate::doc::{Document, Edit, EditKind, Motion};
 use crate::diffview::{self, DiffState};
 use crate::editor::{self, Settings, View};
+use crate::history::{self, History};
 use crate::highlight::{config_dir, lerp, Colors, LineCache, Syntax};
 use crate::keymap::{self, Cmd};
 use crate::findfiles;
@@ -34,6 +35,7 @@ enum PMode {
     Syntaxes,
     Clipboard,
     DiffTab,
+    History,
 }
 
 #[derive(Clone)]
@@ -45,6 +47,7 @@ enum PAction {
     Syntax(String),
     Clip(usize),
     DiffTab(usize),
+    History(usize),
 }
 
 struct PItem {
@@ -110,6 +113,7 @@ enum TreeAction {
     Compare(PathBuf, PathBuf),
     /// Diff a file against the active editor.
     CompareWithActive(PathBuf),
+    History(PathBuf),
 }
 
 enum Pending {
@@ -174,6 +178,9 @@ pub struct App {
     /// When the Go to File list went stale (re-walked after 0.5s without changes).
     files_stale: Option<f64>,
     fif: Fif,
+    history: History,
+    /// File and versions listed by the Local History palette.
+    history_list: (PathBuf, Vec<history::Version>),
 }
 
 impl App {
@@ -230,6 +237,8 @@ impl App {
             fs: FsWatch::new(cc.egui_ctx.clone()),
             files_stale: None,
             fif: Fif::default(),
+            history: History::start(),
+            history_list: (PathBuf::new(), vec![]),
         };
         let session = Session::load();
         let had_session = session.is_some();
@@ -434,6 +443,7 @@ impl App {
                 doc.camel_humps = self.camel_humps;
                 let first = if doc.rope.len_lines() > 0 { line_text(&doc.rope, 0) } else { String::new() };
                 let syntax = self.syn.detect(Some(p), &first);
+                self.history.record(p, &doc.rope, history::Event::Opened);
                 self.push_tab(Tab { doc, view: View::new(syntax), diff: None });
             }
             Err(e) => self.status = Some((format!("Cannot open {}: {e}", p.display()), 0.0)),
@@ -482,7 +492,10 @@ impl App {
             return self.save_as(i);
         };
         match self.tabs[i].doc.save_to(&p) {
-            Ok(()) => true,
+            Ok(()) => {
+                self.history.record(&p, &self.tabs[i].doc.rope, history::Event::Saved);
+                true
+            }
             Err(e) => {
                 self.status = Some((format!("Save failed: {e}"), 0.0));
                 false
@@ -498,6 +511,7 @@ impl App {
         let Some(p) = dlg.save_file() else { return false };
         match self.tabs[i].doc.save_to(&p) {
             Ok(()) => {
+                self.history.record(&p, &self.tabs[i].doc.rope, history::Event::Saved);
                 let first = line_text(&self.tabs[i].doc.rope, 0);
                 let syntax = self.syn.detect(Some(&p), &first);
                 self.tabs[i].view.cache = LineCache::new(syntax);
@@ -792,6 +806,7 @@ impl App {
                 Some((a, b)) => self.run_tree_action(ctx, TreeAction::Compare(a, b)),
                 None => self.set_status(ctx, "Ctrl+click two files in the sidebar first"),
             },
+            ShowHistory => self.show_history(ctx),
             ShowDiff => {
                 if let Some((a, b)) = self.tree_pair() {
                     self.run_tree_action(ctx, TreeAction::Compare(a, b));
@@ -1184,6 +1199,20 @@ impl App {
                     }
                 }
             }
+            PMode::History => {
+                let now = history::now_ms();
+                for (i, v) in self.history_list.1.iter().enumerate() {
+                    let (time, day) = history::format_time(v.time);
+                    let ago = match now.saturating_sub(v.time) / 1000 {
+                        s if s < 60 => format!("{s} s ago"),
+                        s if s < 3600 => format!("{} min ago", s / 60),
+                        s if s < 86400 => format!("{} h ago", s / 3600),
+                        s => format!("{} days ago", s / 86400),
+                    };
+                    let label = format!("{day} {time}   {}", history::Event::label(&v.event));
+                    push(label, format!("{ago} · {} chars", v.chars), PAction::History(i), query);
+                }
+            }
         }
         if !query.is_empty() && mode != PMode::Clipboard {
             items.sort_by(|a, b| b.0.cmp(&a.0));
@@ -1238,6 +1267,7 @@ impl App {
             PMode::Syntaxes => "Set syntax…",
             PMode::Clipboard => "Paste from history…",
             PMode::DiffTab => "Compare with tab…",
+            PMode::History => "Local history: pick a version to compare…",
         };
         let colors = self.colors.clone();
         egui::Area::new(Id::new("palette"))
@@ -1345,6 +1375,17 @@ impl App {
                     self.open_diff(ctx, Ok(text), title);
                 }
             }
+            PAction::History(i) => {
+                let Some(v) = self.history_list.1.get(i).cloned() else { return };
+                let path = self.history_list.0.clone();
+                if self.tabs[self.active].doc.path.as_ref() != Some(&path) {
+                    self.open_path(&path);
+                }
+                let (time, day) = history::format_time(v.time);
+                let title = format!("Local History: {day} {time} ({})", history::Event::label(&v.event));
+                let text = self.history.load(&v).ok_or_else(|| "This version is no longer stored".to_string());
+                self.open_diff(ctx, text, title);
+            }
         }
     }
 
@@ -1385,7 +1426,26 @@ impl App {
                 let text = self.file_text(&p);
                 self.open_diff(ctx, text, title);
             }
+            TreeAction::History(p) => {
+                self.open_path(&p);
+                if self.tabs[self.active].doc.path.as_deref() == Some(p.as_path()) {
+                    self.show_history(ctx);
+                }
+            }
         }
+    }
+
+    /// Local History of the current file: list its versions in the palette.
+    fn show_history(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.tabs[self.active].doc.path.clone() else {
+            return self.set_status(ctx, "Local history is kept for saved files only");
+        };
+        let versions = self.history.versions(&path);
+        if versions.is_empty() {
+            return self.set_status(ctx, format!("No local history for {} yet", file_name(&path)));
+        }
+        self.history_list = (path, versions);
+        self.open_palette(PMode::History, "");
     }
 
     fn open_diff(&mut self, ctx: &egui::Context, left: Result<String, String>, title: String) {
@@ -1667,6 +1727,8 @@ impl App {
                 Ok(()) => {
                     count += reps.len();
                     on_disk += 1;
+                    self.history.record_str(&p, &before, history::Event::BeforeReplace);
+                    self.history.record_str(&p, &after, history::Event::Replaced);
                     undo.push((p, before, after));
                 }
                 Err(_) => {
@@ -2006,10 +2068,14 @@ impl App {
             return; // unchanged, e.g. our own save
         }
         let name = doc.name();
-        if doc.is_dirty() {
+        let dirty = doc.is_dirty();
+        if !dirty {
+            doc.reload(&text);
+        }
+        self.history.record_str(&p, &disk, history::Event::ChangedOnDisk);
+        if dirty {
             self.set_status(ctx, format!("{name} changed on disk; your unsaved edits are kept (Ctrl+D compares)"));
         } else {
-            doc.reload(&text);
             if i == self.active {
                 self.set_status(ctx, format!("Reloaded {name}: changed on disk"));
             }
@@ -2071,6 +2137,10 @@ impl App {
                     let can_active = active.is_some_and(|a| a != path.as_path());
                     if ui.add_enabled(can_active, egui::Button::new("Compare with Active File")).clicked() {
                         self.tree_action = Some(TreeAction::CompareWithActive(path.clone()));
+                        ui.close_menu();
+                    }
+                    if ui.button("Local History…").clicked() {
+                        self.tree_action = Some(TreeAction::History(path.clone()));
                         ui.close_menu();
                     }
                     ui.separator();
@@ -2138,6 +2208,10 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.history.shutdown(); // finish writing recorded versions
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if ctx.input(|i| i.viewport().close_requested()) {
             // Hot exit: unsaved buffers are backed up and restored next time, so quitting
@@ -2186,7 +2260,7 @@ impl eframe::App for App {
                     }
                 });
                 ui.menu_button("Diff", |ui| {
-                    for cmd in [Cmd::DiffWithSaved, Cmd::DiffWithHead, Cmd::DiffWithClipboard, Cmd::DiffWithFile, Cmd::DiffWithTab, Cmd::DiffTreeSelection, Cmd::ShowDiff, Cmd::NextDiff, Cmd::PrevDiff, Cmd::CloseDiff] {
+                    for cmd in [Cmd::DiffWithSaved, Cmd::DiffWithHead, Cmd::DiffWithClipboard, Cmd::DiffWithFile, Cmd::DiffWithTab, Cmd::DiffTreeSelection, Cmd::ShowDiff, Cmd::ShowHistory, Cmd::NextDiff, Cmd::PrevDiff, Cmd::CloseDiff] {
                         item(ui, cmd, self);
                     }
                 });

@@ -13,6 +13,8 @@ rfd = "0.15"
 similar = "2"
 arboard = "3"
 notify = "6"
+miniz_oxide = "0.8"
+time = { version = "0.3", features = ["local-offset"] }
 
 [profile.release]
 opt-level = 3

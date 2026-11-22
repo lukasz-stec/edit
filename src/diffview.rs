@@ -158,6 +158,19 @@ pub fn show(ui: &mut egui::Ui, right: &mut Document, view: &mut View, st: &mut D
             if ui.button("× Close diff").on_hover_text("Esc").clicked() {
                 outcome = Outcome::Close;
             }
+            if n > 0
+                && ui
+                    .button("« Revert All")
+                    .on_hover_text("Replace the whole right side with the left side (Ctrl+Z undoes)")
+                    .clicked()
+            {
+                let head = right.primary_sel().head;
+                let text = st.left.rope.to_string();
+                let end = right.rope.len_chars();
+                right.apply(EditKind::Other, vec![Edit { start: 0, end, text, anchor: 0, head: 0 }]);
+                let c = head.min(right.rope.len_chars());
+                right.set_sels(vec![Sel::caret(c)], 0);
+            }
         });
     });
 

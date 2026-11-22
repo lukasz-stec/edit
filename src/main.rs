@@ -7,6 +7,7 @@ mod doc;
 mod editor;
 mod findfiles;
 mod highlight;
+mod history;
 mod icon;
 mod keymap;
 mod search;
@@ -19,6 +20,7 @@ use eframe::egui;
 use std::path::PathBuf;
 
 fn main() -> eframe::Result<()> {
+    history::init_local_offset(); // before any other thread starts
     let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

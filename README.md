@@ -42,6 +42,9 @@ Pass files or a folder on the command line: `edit path/to/project path/to/file.r
   another file or tab, or two files selected in the sidebar.
 - **Session restore and hot exit**: open files, carets and scroll positions come back
   on restart, and so do unsaved changes, without asking you to save when quitting.
+- **Local History** like IntelliJ: every file version you open, save, or that changes on disk
+  is kept for 30 days (compressed, deduplicated, written in the background). Pick a version
+  to compare it with the current text and revert single changes or everything.
 - **Follows the disk**: the sidebar updates when files are created, deleted or renamed,
   and open files reload when another program changes them (your unsaved edits are
   never overwritten; you get a warning instead).
@@ -111,6 +114,7 @@ On macOS, `Cmd` works wherever `Ctrl` is listed.
 |---|---|
 | `Ctrl+D` | Show diff: two files selected in the sidebar, else unsaved changes, else Git HEAD |
 | `F7` / `Shift+F7` | Next / previous change |
+| `Alt+Shift+H` | Local History of the current file (also: right-click a file in the sidebar) |
 | Ctrl+click two files in the sidebar, right-click | Compare selected files |
 
 More comparisons (clipboard, another file, another tab) are in the **Diff** menu.
