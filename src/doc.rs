@@ -224,6 +224,17 @@ impl Document {
         Ok(d)
     }
 
+    /// Hot exit: load unsaved contents from a backup; the buffer stays dirty.
+    pub fn load_backup(&mut self, text: &str, crlf: bool) {
+        self.set_text(text);
+        self.crlf = crlf;
+        self.sels = vec![Sel::caret(0)];
+        self.primary = 0;
+        self.version = self.next_version;
+        self.next_version += 1;
+        self.dirty_line = Some(0);
+    }
+
     pub fn save_to(&mut self, path: &Path) -> std::io::Result<()> {
         let mut s = self.rope.to_string();
         if self.crlf {

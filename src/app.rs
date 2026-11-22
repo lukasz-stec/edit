@@ -6,7 +6,7 @@ use crate::highlight::{config_dir, lerp, Colors, LineCache, Syntax};
 use crate::keymap::{self, Cmd};
 use crate::search;
 use crate::selection::Sel;
-use crate::session::{FileState, Session};
+use crate::session::{self, FileState, Session};
 use crate::text::line_text;
 use eframe::egui::{
     self, text::LayoutJob, vec2, Align2, Color32, Event, FontData, FontDefinitions, FontFamily,
@@ -114,6 +114,10 @@ pub struct App {
     ctrl_prev: bool,
     ctrl_last_press: f64,
     double_ctrl: bool,
+    /// Unique per run, so backup names never collide with a previous run's files.
+    run_tag: String,
+    /// doc id -> version last written to its backup file.
+    backed_up: HashMap<u64, u64>,
 }
 
 impl App {
@@ -157,6 +161,11 @@ impl App {
             ctrl_prev: false,
             ctrl_last_press: -1.0,
             double_ctrl: false,
+            run_tag: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis().to_string())
+                .unwrap_or_else(|_| std::process::id().to_string()),
+            backed_up: HashMap::new(),
         };
         let session = Session::load();
         let had_session = session.is_some();
@@ -177,7 +186,7 @@ impl App {
     // ------------------------------------------------------------ session
 
     fn restore(&mut self, s: Session) {
-        if let Some(t) = s.theme.filter(|t| self.syn.themes.themes.contains_key(t)) {
+        if let Some(t) = s.theme.clone().filter(|t| self.syn.themes.themes.contains_key(t)) {
             self.theme_name = t;
         }
         if let Some(f) = s.font_size {
@@ -189,43 +198,74 @@ impl App {
         if let Some(c) = s.camel_humps {
             self.camel_humps = c;
         }
-        if let Some(r) = s.root.filter(|r| r.is_dir()) {
+        if let Some(r) = s.root.clone().filter(|r| r.is_dir()) {
             self.set_root(r);
         }
+        let mut tab_of_entry: Vec<Option<usize>> = vec![];
+        let mut unsaved = 0;
         for f in &s.files {
-            if !f.path.is_file() {
-                continue; // deleted or moved since last run
+            let backup = f.backup.as_deref().and_then(session::read_backup);
+            match (backup, &f.path) {
+                // hot exit: unsaved contents (of a file or an untitled buffer)
+                (Some(text), path) => {
+                    let mut doc = Document::new();
+                    doc.camel_humps = self.camel_humps;
+                    doc.path = path.clone();
+                    doc.load_backup(&text, f.crlf);
+                    let first = line_text(&doc.rope, 0);
+                    let syntax = self.syn.detect(path.as_deref(), &first);
+                    self.push_tab(Tab { doc, view: View::new(syntax) });
+                    unsaved += 1;
+                }
+                // clean file (or its backup is gone): reload from disk
+                (None, Some(p)) if p.is_file() => self.open_path(p),
+                _ => {
+                    tab_of_entry.push(None);
+                    continue;
+                }
             }
-            self.open_path(&f.path);
             let t = self.cur();
-            if t.doc.path.as_deref() == Some(f.path.as_path()) {
-                t.doc.set_sels(vec![Sel::new(f.anchor, f.head)], 0);
-                t.view.scroll.y = f.scroll_y;
-            }
+            t.doc.set_sels(vec![Sel::new(f.anchor, f.head)], 0);
+            t.view.scroll.y = f.scroll_y;
+            tab_of_entry.push(Some(self.active));
         }
-        if let Some(p) = s.files.get(s.active).map(|f| &f.path) {
-            if let Some(i) = self.tabs.iter().position(|t| t.doc.path.as_deref() == Some(p.as_path())) {
-                self.active = i;
-            }
+        if let Some(Some(i)) = tab_of_entry.get(s.active) {
+            self.active = *i;
         }
         if let Some(b) = s.sidebar {
             self.sidebar = b;
         }
+        if unsaved > 0 {
+            self.status = Some((format!("Restored {unsaved} unsaved buffer(s)"), 0.0));
+        }
     }
 
+    fn backup_name(&self, doc: &Document) -> String {
+        format!("{}-{}.txt", self.run_tag, doc.id)
+    }
+
+    /// Tabs that go into the session: files, and unsaved buffers (hot exit).
     fn session(&self) -> Session {
-        let with_path = |t: &Tab| t.doc.path.is_some();
+        let included = |t: &Tab| t.doc.path.is_some() || t.doc.is_dirty();
         Session {
             root: self.root.clone(),
             files: self
                 .tabs
                 .iter()
-                .filter_map(|t| {
+                .filter(|t| included(t))
+                .map(|t| {
                     let s = t.doc.primary_sel();
-                    Some(FileState { path: t.doc.path.clone()?, anchor: s.anchor, head: s.head, scroll_y: t.view.scroll.y })
+                    FileState {
+                        path: t.doc.path.clone(),
+                        backup: t.doc.is_dirty().then(|| self.backup_name(&t.doc)),
+                        crlf: t.doc.crlf,
+                        anchor: s.anchor,
+                        head: s.head,
+                        scroll_y: t.view.scroll.y,
+                    }
                 })
                 .collect(),
-            active: self.tabs[..self.active].iter().filter(|t| with_path(t)).count(),
+            active: self.tabs[..self.active].iter().filter(|t| included(t)).count(),
             theme: Some(self.theme_name.clone()),
             font_size: Some(self.settings.font_size),
             sidebar: Some(self.sidebar),
@@ -234,23 +274,50 @@ impl App {
         }
     }
 
-    /// Save the session when it changed: throttled to every 2s, immediately when `force`.
-    fn persist_session(&mut self, ctx: &egui::Context, force: bool) {
-        let text = self.session().to_text();
-        if text == self.session_text {
-            return;
+    /// Save the session and unsaved-buffer backups when something changed: throttled to
+    /// every 2s, immediately when `force`. Returns false if anything failed to save.
+    fn persist_session(&mut self, ctx: &egui::Context, force: bool) -> bool {
+        let pending: Vec<usize> = (0..self.tabs.len())
+            .filter(|&i| {
+                let d = &self.tabs[i].doc;
+                d.is_dirty() && self.backed_up.get(&d.id) != Some(&d.version)
+            })
+            .collect();
+        let session = self.session();
+        let text = session.to_text();
+        if text == self.session_text && pending.is_empty() {
+            return true;
         }
         let now = ctx.input(|i| i.time);
         let since = now - self.session_saved_at;
         if !force && since < 2.0 {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(2.05 - since));
-            return;
+            return true;
         }
-        if let Err(e) = Session::save_text(&text) {
-            self.set_status(ctx, format!("Could not save session: {e}"));
+        let mut ok = true;
+        for i in pending {
+            let d = &self.tabs[i].doc;
+            let (id, version, name) = (d.id, d.version, self.backup_name(d));
+            match session::write_backup(&name, &d.rope.to_string()) {
+                Ok(()) => {
+                    self.backed_up.insert(id, version);
+                }
+                Err(e) => {
+                    ok = false;
+                    self.set_status(ctx, format!("Could not back up unsaved changes: {e}"));
+                }
+            }
+        }
+        match Session::save_text(&text) {
+            Ok(()) => session::cleanup_backups(&session.backup_names()),
+            Err(e) => {
+                ok = false;
+                self.set_status(ctx, format!("Could not save session: {e}"));
+            }
         }
         self.session_text = text;
         self.session_saved_at = now;
+        ok
     }
 
     fn apply_visuals(&mut self, ctx: &egui::Context) {
@@ -303,16 +370,20 @@ impl App {
                 doc.camel_humps = self.camel_humps;
                 let first = if doc.rope.len_lines() > 0 { line_text(&doc.rope, 0) } else { String::new() };
                 let syntax = self.syn.detect(Some(p), &first);
-                let tab = Tab { doc, view: View::new(syntax) };
-                if self.tabs.len() == 1 && self.tabs[0].doc.is_pristine() {
-                    self.tabs[0] = tab;
-                    self.active = 0;
-                } else {
-                    self.tabs.push(tab);
-                    self.active = self.tabs.len() - 1;
-                }
+                self.push_tab(Tab { doc, view: View::new(syntax) });
             }
             Err(e) => self.status = Some((format!("Cannot open {}: {e}", p.display()), 0.0)),
+        }
+    }
+
+    /// Add a tab and activate it, replacing the initial empty untitled tab.
+    fn push_tab(&mut self, tab: Tab) {
+        if self.tabs.len() == 1 && self.tabs[0].doc.is_pristine() {
+            self.tabs[0] = tab;
+            self.active = 0;
+        } else {
+            self.tabs.push(tab);
+            self.active = self.tabs.len() - 1;
         }
     }
 
@@ -1182,11 +1253,12 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if ctx.input(|i| i.viewport().close_requested()) {
-            if !self.allow_quit && self.tabs.iter().any(|t| t.doc.is_dirty()) {
+            // Hot exit: unsaved buffers are backed up and restored next time, so quitting
+            // doesn't ask. Only if the backup fails do we fall back to the save prompt.
+            let saved = self.persist_session(ctx, true);
+            if !saved && !self.allow_quit && self.tabs.iter().any(|t| t.doc.is_dirty()) {
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
                 self.pending = Some(Pending::Quit);
-            } else {
-                self.persist_session(ctx, true);
             }
         }
 
