@@ -9,6 +9,7 @@ pub enum Cmd {
     NewFile,
     OpenFile,
     OpenFolder,
+    AddFolder,
     Save,
     SaveAs,
     SaveAll,
@@ -86,7 +87,7 @@ impl Cmd {
         use Cmd::*;
         matches!(
             self,
-            NewFile | OpenFile | OpenFolder | Save | SaveAs | SaveAll | CloseTab | NextTab | PrevTab
+            NewFile | OpenFile | OpenFolder | AddFolder | Save | SaveAs | SaveAll | CloseTab | NextTab | PrevTab
                 | CommandPalette | GotoAnything | GotoLine | Find | Replace | FindNext | FindPrev
                 | ToggleSidebar | ToggleMinimap | SelectTheme | SetSyntax | PasteFromHistory | ZoomIn
                 | ZoomOut | ZoomReset | ToggleCamelHumps | ToggleIndentation | ToggleLineEndings | ToggleColumnMode | Quit
@@ -101,6 +102,7 @@ impl Cmd {
             NewFile => "File: New File",
             OpenFile => "File: Open File…",
             OpenFolder => "File: Open Folder…",
+            AddFolder => "File: Add Folder to Sidebar…",
             Save => "File: Save",
             SaveAs => "File: Save As…",
             SaveAll => "File: Save All",
@@ -172,7 +174,7 @@ impl Cmd {
     pub fn palette() -> &'static [Cmd] {
         use Cmd::*;
         &[
-            NewFile, OpenFile, OpenFolder, Save, SaveAs, SaveAll, CloseTab, GotoAnything, GotoLine,
+            NewFile, OpenFile, OpenFolder, AddFolder, Save, SaveAs, SaveAll, CloseTab, GotoAnything, GotoLine,
             Find, Replace, ToggleSidebar, ToggleMinimap, SelectTheme, SetSyntax, PasteFromHistory,
             ZoomIn, ZoomOut, ZoomReset, ToggleCamelHumps, ToggleIndentation, ToggleLineEndings,
             Undo, Redo, SelectAll, SelectLine, ExpandSelection, ShrinkSelection,

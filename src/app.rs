@@ -105,7 +105,8 @@ pub struct App {
     settings: Settings,
     default_font: f32,
     sidebar: bool,
-    root: Option<PathBuf>,
+    /// Folders shown in the sidebar (File › Open Folder replaces, Add Folder appends).
+    roots: Vec<PathBuf>,
     dir_cache: HashMap<PathBuf, Vec<(PathBuf, bool)>>,
     files: Vec<PathBuf>,
     palette: Option<Palette>,
@@ -166,7 +167,7 @@ impl App {
             settings: Settings { font_size: 14.0, line_spacing: 1.35, minimap: true },
             default_font: 14.0,
             sidebar: true,
-            root: None,
+            roots: vec![],
             dir_cache: HashMap::new(),
             files: vec![],
             palette: None,
@@ -208,7 +209,7 @@ impl App {
         for a in args {
             app.open_path(&a);
         }
-        if !had_session && app.root.is_none() && app.tabs.iter().all(|t| t.doc.path.is_none()) {
+        if !had_session && app.roots.is_empty() && app.tabs.iter().all(|t| t.doc.path.is_none()) {
             app.sidebar = false;
         }
         app.startup_focus = true;
@@ -230,8 +231,8 @@ impl App {
         if let Some(c) = s.camel_humps {
             self.camel_humps = c;
         }
-        if let Some(r) = s.root.clone().filter(|r| r.is_dir()) {
-            self.set_root(r);
+        for r in s.roots.iter().filter(|r| r.is_dir()) {
+            self.add_root(r.clone());
         }
         let mut tab_of_entry: Vec<Option<usize>> = vec![];
         let mut unsaved = 0;
@@ -280,7 +281,7 @@ impl App {
     fn session(&self) -> Session {
         let included = |t: &Tab| t.doc.path.is_some() || t.doc.is_dirty();
         Session {
-            root: self.root.clone(),
+            roots: self.roots.clone(),
             files: self
                 .tabs
                 .iter()
@@ -390,7 +391,7 @@ impl App {
         let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
         let p = abs.as_path();
         if p.is_dir() {
-            self.set_root(p.to_path_buf());
+            self.add_root(p.to_path_buf());
             return;
         }
         if let Some(i) = self.tabs.iter().position(|t| t.doc.path.as_deref() == Some(p)) {
@@ -419,14 +420,30 @@ impl App {
         }
     }
 
+    /// Show only `dir` in the sidebar (File › Open Folder).
     fn set_root(&mut self, dir: PathBuf) {
-        let dir = std::path::absolute(&dir).unwrap_or(dir);
+        self.roots.clear();
         self.dir_cache.clear();
         self.tree_sel.clear();
+        self.add_root(dir);
+    }
+
+    /// Add `dir` to the sidebar's folders (File › Add Folder, drag & drop, command line).
+    fn add_root(&mut self, dir: PathBuf) {
+        let dir = std::path::absolute(&dir).unwrap_or(dir);
+        if !self.roots.contains(&dir) {
+            self.roots.push(dir);
+        }
         self.tree_followed = None;
-        self.files = walk(&dir, 50_000);
-        self.root = Some(dir);
+        self.files = walk_roots(&self.roots);
         self.sidebar = true;
+    }
+
+    fn remove_root(&mut self, i: usize) {
+        let dir = self.roots.remove(i);
+        self.dir_cache.retain(|p, _| !p.starts_with(&dir) || self.roots.iter().any(|r| p.starts_with(r)));
+        self.tree_sel.retain(|p| !p.starts_with(&dir));
+        self.files = walk_roots(&self.roots);
     }
 
     fn save(&mut self, i: usize) -> bool {
@@ -444,7 +461,7 @@ impl App {
 
     fn save_as(&mut self, i: usize) -> bool {
         let mut dlg = rfd::FileDialog::new().set_file_name(self.tabs[i].doc.name());
-        if let Some(dir) = self.tabs[i].doc.path.as_ref().and_then(|p| p.parent()).or(self.root.as_deref()) {
+        if let Some(dir) = self.tabs[i].doc.path.as_ref().and_then(|p| p.parent()).or(self.roots.first().map(PathBuf::as_path)) {
             dlg = dlg.set_directory(dir);
         }
         let Some(p) = dlg.save_file() else { return false };
@@ -660,6 +677,13 @@ impl App {
             OpenFolder => {
                 if let Some(d) = rfd::FileDialog::new().pick_folder() {
                     self.set_root(d);
+                }
+            }
+            AddFolder => {
+                if let Some(dirs) = rfd::FileDialog::new().pick_folders() {
+                    for d in dirs {
+                        self.add_root(d);
+                    }
                 }
             }
             Save => {
@@ -1123,13 +1147,15 @@ impl App {
         items.into_iter().take(300).map(|x| x.1).collect()
     }
 
+    /// Path relative to its sidebar folder; prefixed with the folder name when there are
+    /// several, so files with the same name in different folders can be told apart.
     fn rel(&self, p: &Path) -> String {
-        self.root
-            .as_ref()
-            .and_then(|r| p.strip_prefix(r).ok())
-            .unwrap_or(p)
-            .to_string_lossy()
-            .replace('\\', "/")
+        let root = self.roots.iter().filter(|r| p.starts_with(r)).max_by_key(|r| r.as_os_str().len());
+        let rel = root.and_then(|r| p.strip_prefix(r).ok()).unwrap_or(p).to_string_lossy().replace('\\', "/");
+        match root.and_then(|r| r.file_name()) {
+            Some(name) if self.roots.len() > 1 => format!("{}/{rel}", name.to_string_lossy()),
+            _ => rel,
+        }
     }
 
     fn palette_ui(&mut self, ctx: &egui::Context) {
@@ -1416,12 +1442,12 @@ impl App {
     /// Follow changes on disk: refresh the tree and reload open files that changed.
     fn sync_fs(&mut self, ctx: &egui::Context) {
         let mut want = HashMap::new();
-        if let Some(r) = &self.root {
+        for r in &self.roots {
             want.insert(r.clone(), watch::Mode::Recursive);
         }
         for t in &self.tabs {
             if let Some(dir) = t.doc.path.as_ref().and_then(|p| p.parent()) {
-                if !self.root.as_ref().is_some_and(|r| dir.starts_with(r)) && dir.is_dir() {
+                if !self.roots.iter().any(|r| dir.starts_with(r)) && dir.is_dir() {
                     want.insert(dir.to_path_buf(), watch::Mode::NonRecursive);
                 }
             }
@@ -1452,9 +1478,9 @@ impl App {
                 self.reload_from_disk(ctx, i);
             }
         }
-        if let (Some(t), Some(root)) = (self.files_stale, self.root.clone()) {
+        if let Some(t) = self.files_stale {
             if now - t >= 0.5 {
-                self.files = walk(&root, 50_000);
+                self.files = walk_roots(&self.roots);
                 self.files_stale = None;
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64(0.55 - (now - t)));
@@ -1632,7 +1658,7 @@ impl eframe::App for App {
                     }
                 };
                 ui.menu_button("File", |ui| {
-                    for cmd in [Cmd::NewFile, Cmd::OpenFile, Cmd::OpenFolder, Cmd::Save, Cmd::SaveAs, Cmd::SaveAll, Cmd::CloseTab, Cmd::Quit] {
+                    for cmd in [Cmd::NewFile, Cmd::OpenFile, Cmd::OpenFolder, Cmd::AddFolder, Cmd::Save, Cmd::SaveAs, Cmd::SaveAll, Cmd::CloseTab, Cmd::Quit] {
                         item(ui, cmd, self);
                     }
                 });
@@ -1728,15 +1754,7 @@ impl eframe::App for App {
                         self.focus_editor(ctx);
                     }
                     ui.add_space(8.0);
-                    if let Some(root) = self.root.clone() {
-                        ui.horizontal(|ui| {
-                            let name = root.file_name().map(|n| n.to_string_lossy().to_uppercase()).unwrap_or_default();
-                            ui.label(RichText::new(format!("FOLDER · {name}")).small().weak());
-                            if ui.small_button("⟳").on_hover_text("Refresh").clicked() {
-                                self.dir_cache.clear();
-                                self.files = walk(&root, 50_000);
-                            }
-                        });
+                    if !self.roots.is_empty() {
                         let active = self.tabs[self.active].doc.path.clone();
                         // Without a multi-selection, the tree's selection follows the active
                         // file, so Ctrl+clicking one more file selects a pair (as in IntelliJ).
@@ -1746,7 +1764,38 @@ impl eframe::App for App {
                                 self.tree_sel = active.iter().cloned().collect();
                             }
                         }
-                        self.tree_ui(ui, &root, active.as_deref());
+                        let mut remove = None;
+                        for (i, root) in self.roots.clone().into_iter().enumerate() {
+                            let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| root.display().to_string());
+                            let id = ui.make_persistent_id(("root", &root));
+                            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
+                                .show_header(ui, |ui| {
+                                    let r = ui.label(RichText::new(name.to_uppercase()).small().strong()).on_hover_text(root.display().to_string());
+                                    r.context_menu(|ui| {
+                                        if ui.button("Remove Folder from Sidebar").clicked() {
+                                            remove = Some(i);
+                                            ui.close_menu();
+                                        }
+                                    });
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.small_button("×").on_hover_text("Remove folder from sidebar").clicked() {
+                                            remove = Some(i);
+                                        }
+                                        if ui.small_button("⟳").on_hover_text("Refresh").clicked() {
+                                            self.dir_cache.retain(|p, _| !p.starts_with(&root));
+                                            self.files_stale = Some(0.0);
+                                        }
+                                    });
+                                })
+                                .body(|ui| self.tree_ui(ui, &root, active.as_deref()));
+                        }
+                        if let Some(i) = remove {
+                            self.remove_root(i);
+                        }
+                        ui.add_space(4.0);
+                        if ui.small_button("+ Add Folder…").clicked() {
+                            self.run_global(ctx, Cmd::AddFolder);
+                        }
                     } else if ui.button("Open Folder…").clicked() {
                         self.run_global(ctx, Cmd::OpenFolder);
                     }
@@ -1855,7 +1904,13 @@ impl eframe::App for App {
             "{}{}{} — edit{}",
             if d.is_dirty() { "● " } else { "" },
             d.name(),
-            self.root.as_ref().and_then(|r| r.file_name()).map(|n| format!(" · {}", n.to_string_lossy())).unwrap_or_default(),
+            match self.roots.as_slice() {
+                [] => String::new(),
+                [r, rest @ ..] => {
+                    let name = r.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    if rest.is_empty() { format!(" · {name}") } else { format!(" · {name} +{}", rest.len()) }
+                }
+            },
             option_env!("EDIT_VERSION").map(|v| format!(" {v}")).unwrap_or_default()
         );
         if title != self.title {
@@ -1909,6 +1964,19 @@ fn list_dir(dir: &Path) -> Vec<(PathBuf, bool)> {
         })
     });
     v
+}
+
+/// Files under all sidebar folders (for Go to File), without duplicates from nested folders.
+fn walk_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = vec![];
+    for (i, r) in roots.iter().enumerate() {
+        // a folder inside another sidebar folder is already covered by the outer one
+        if roots.iter().enumerate().any(|(j, o)| j != i && r.starts_with(o) && (r != o || j < i)) {
+            continue;
+        }
+        out.extend(walk(r, 50_000usize.saturating_sub(out.len())));
+    }
+    out
 }
 
 fn walk(root: &Path, limit: usize) -> Vec<PathBuf> {

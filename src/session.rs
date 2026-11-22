@@ -23,7 +23,8 @@ pub struct FileState {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Session {
-    pub root: Option<PathBuf>,
+    /// Folders shown in the sidebar, in order.
+    pub roots: Vec<PathBuf>,
     pub files: Vec<FileState>,
     pub active: usize,
     pub theme: Option<String>,
@@ -66,7 +67,7 @@ fn write_atomic(path: &std::path::Path, text: &str) -> std::io::Result<()> {
 impl Session {
     pub fn to_text(&self) -> String {
         let mut s = String::from("edit-session\t1\n");
-        if let Some(r) = &self.root {
+        for r in &self.roots {
             s += &format!("root\t{}\n", r.display());
         }
         if let Some(t) = &self.theme {
@@ -104,7 +105,7 @@ impl Session {
             let mut parts = line.splitn(2, '\t');
             let (Some(key), Some(val)) = (parts.next(), parts.next()) else { continue };
             match key {
-                "root" => s.root = Some(PathBuf::from(val)),
+                "root" => s.roots.push(PathBuf::from(val)),
                 "theme" => s.theme = Some(val.to_string()),
                 "font" => s.font_size = val.parse().ok(),
                 "sidebar" => s.sidebar = Some(val == "1"),
@@ -194,7 +195,7 @@ mod tests {
     #[test]
     fn roundtrip() {
         let s = Session {
-            root: Some(PathBuf::from(r"C:\proj\my app")),
+            roots: vec![PathBuf::from(r"C:\proj\my app"), PathBuf::from(r"D:\other")],
             files: vec![
                 FileState {
                     path: Some(PathBuf::from(r"C:\proj\my app\src\main.rs")),

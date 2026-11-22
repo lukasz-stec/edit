@@ -27,7 +27,8 @@ Pass files or a folder on the command line: `edit path/to/project path/to/file.r
 
 - **Fast**: native GPU-rendered UI, rope-based buffers, incremental syntax highlighting
   of 100+ languages; large files stay responsive.
-- **Sublime basics**: tabs, sidebar folder tree, Go to Anything (fuzzy file finder),
+- **Sublime basics**: tabs, a sidebar with one or more folders (File › Add Folder),
+  Go to Anything (fuzzy file finder),
   command palette, find/replace with regex, minimap.
 - **IntelliJ editing**: CamelHumps word movement (`Ctrl+←/→` stops inside `camelCase`
   and `snake_case` words), Extend/Shrink Selection, Start New Line, Join Lines,
