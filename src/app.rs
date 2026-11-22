@@ -1852,10 +1852,11 @@ impl eframe::App for App {
         // ---------------- window title
         let d = &self.tabs[self.active].doc;
         let title = format!(
-            "{}{}{} — edit",
+            "{}{}{} — edit{}",
             if d.is_dirty() { "● " } else { "" },
             d.name(),
-            self.root.as_ref().and_then(|r| r.file_name()).map(|n| format!(" · {}", n.to_string_lossy())).unwrap_or_default()
+            self.root.as_ref().and_then(|r| r.file_name()).map(|n| format!(" · {}", n.to_string_lossy())).unwrap_or_default(),
+            option_env!("EDIT_VERSION").map(|v| format!(" {v}")).unwrap_or_default()
         );
         if title != self.title {
             ctx.send_viewport_cmd(ViewportCommand::Title(title.clone()));
@@ -1946,6 +1947,21 @@ fn setup_fonts(ctx: &egui::Context) {
     candidates.push(win.join("JetBrainsMono-Regular.ttf"));
     candidates.push(win.join("CascadiaMono.ttf"));
     candidates.push(win.join("consola.ttf"));
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        candidates.push(home.join("Library/Fonts/JetBrainsMono-Regular.ttf"));
+        candidates.push(home.join(".local/share/fonts/JetBrainsMono-Regular.ttf"));
+    }
+    for p in [
+        "/Library/Fonts/JetBrainsMono-Regular.ttf",
+        "/System/Library/Fonts/SFNSMono.ttf",
+        "/System/Library/Fonts/Menlo.ttc",
+        "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf",
+        "/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+    ] {
+        candidates.push(PathBuf::from(p));
+    }
     for p in candidates {
         if let Ok(bytes) = std::fs::read(&p) {
             fonts.font_data.insert("mono".into(), FontData::from_owned(bytes));

@@ -9,10 +9,18 @@ use syntect::highlighting::{
 };
 use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
 
+/// Settings folder: `%APPDATA%\edit` on Windows, `~/Library/Application Support/edit` on
+/// macOS, `$XDG_CONFIG_HOME/edit` or `~/.config/edit` elsewhere.
 pub fn config_dir() -> Option<PathBuf> {
-    std::env::var_os("APPDATA")
-        .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
-        .map(|d| PathBuf::from(d).join("edit"))
+    let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let base = if cfg!(windows) {
+        env("APPDATA")
+    } else if cfg!(target_os = "macos") {
+        env("HOME").map(|h| h.join("Library").join("Application Support"))
+    } else {
+        env("XDG_CONFIG_HOME").or_else(|| env("HOME").map(|h| h.join(".config")))
+    };
+    base.map(|d| d.join("edit"))
 }
 
 pub struct Syntax {

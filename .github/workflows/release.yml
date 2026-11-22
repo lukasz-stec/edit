@@ -1,0 +1,129 @@
+# Builds edit for Windows, macOS and Linux on every push to master and publishes the
+# binaries as a GitHub Release tagged v<major>.<minor>.<run number> (major.minor from
+# Cargo.toml). Put [skip ci] in a commit message to push without making a release.
+name: Release
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          base=$(sed -nE 's/^version = "([0-9]+)\.([0-9]+)\..*/\1.\2/p' Cargo.toml | head -1)
+          echo "tag=v$base.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: edit-windows-x64.zip
+          - os: macos-latest
+            asset: edit-macos-universal.zip
+          - os: ubuntu-22.04 # older glibc, so the binary runs on more distros
+            asset: edit-linux-x64.tar.gz
+    runs-on: ${{ matrix.os }}
+    env:
+      EDIT_VERSION: ${{ needs.version.outputs.tag }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - name: Test
+        run: cargo test
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cargo build --release
+          7z a "${{ matrix.asset }}" ./target/release/edit.exe
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release
+          tar -czf "${{ matrix.asset }}" -C target/release edit
+
+      - name: Build (macOS universal .app)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          app=Edit.app/Contents
+          mkdir -p "$app/MacOS"
+          lipo -create -output "$app/MacOS/edit" \
+            target/aarch64-apple-darwin/release/edit target/x86_64-apple-darwin/release/edit
+          cat > "$app/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>Edit</string>
+            <key>CFBundleDisplayName</key><string>Edit</string>
+            <key>CFBundleIdentifier</key><string>io.github.edit.editor</string>
+            <key>CFBundleExecutable</key><string>edit</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${EDIT_VERSION#v}</string>
+            <key>CFBundleVersion</key><string>${EDIT_VERSION#v}</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict></plist>
+          EOF
+          codesign --force --deep --sign - Edit.app   # ad-hoc signature (not notarized)
+          ditto -c -k --keepParent Edit.app "${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          # re-running a workflow reuses its run number: update that release instead
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "edit $TAG" --generate-notes
+          fi
+          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
