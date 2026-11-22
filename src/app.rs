@@ -1,6 +1,6 @@
 //! Application shell: tabs, sidebar, command palette, find bar, dialogs.
 
-use crate::doc::{Document, EditKind, Motion};
+use crate::doc::{Document, Edit, EditKind, Motion};
 use crate::diffview::{self, DiffState};
 use crate::editor::{self, Settings, View};
 use crate::highlight::{config_dir, lerp, Colors, LineCache, Syntax};
@@ -94,6 +94,15 @@ struct Fif {
     /// Selected result: (file index, hit index).
     sel: Option<(usize, usize)>,
     scroll_to_sel: bool,
+    /// Replace row shown (Ctrl+Shift+R).
+    replace: bool,
+    replacement: String,
+    /// Replace All waiting for confirmation: (files open in tabs, files written to disk).
+    confirm: Option<(usize, usize)>,
+    /// Files Replace All wrote to disk: (path, before, after), for Undo Replace.
+    undo: Vec<(PathBuf, String, String)>,
+    /// After a replace, re-select this file and line once the new results arrive.
+    resume: Option<(PathBuf, usize)>,
 }
 
 enum TreeAction {
@@ -742,13 +751,15 @@ impl App {
                 self.find.focus = true;
                 self.find.key = None;
             }
-            FindInFiles => {
+            FindInFiles | ReplaceInFiles => {
                 // IntelliJ: the selected text (one line) becomes the query
                 let doc = &self.tabs[self.active].doc;
                 let s = doc.primary_sel();
                 if !s.is_empty() && doc.rope.char_to_line(s.start()) == doc.rope.char_to_line(s.end()) {
                     self.fif.q.text = doc.rope.slice(s.start()..s.end()).to_string();
                 }
+                self.fif.replace = cmd == ReplaceInFiles;
+                self.fif.confirm = None;
                 self.fif.open = true;
                 self.fif.focus = true;
                 self.fif.dirty_at = Some(0.0);
@@ -1488,13 +1499,20 @@ impl App {
             match m {
                 findfiles::Msg::File(f) => {
                     self.fif.lines += f.hits.len();
-                    self.fif.results.push(f);
-                    if self.fif.sel.is_none() {
-                        self.fif.sel = Some((0, 0));
+                    let fi = self.fif.results.len();
+                    // after a replace, continue from where we were
+                    let resume = self.fif.resume.as_ref().filter(|(p, _)| *p == f.path).map(|&(_, l)| l);
+                    if let Some(l) = resume {
+                        let hi = f.hits.iter().position(|h| h.line >= l).unwrap_or(f.hits.len() - 1);
+                        (self.fif.sel, self.fif.resume, self.fif.scroll_to_sel) = (Some((fi, hi)), None, true);
                     }
+                    self.fif.results.push(f);
                 }
                 findfiles::Msg::Done(n, truncated) => self.fif.done = Some((n, truncated)),
             }
+        }
+        if self.fif.sel.is_none() && !self.fif.results.is_empty() && (self.fif.resume.is_none() || self.fif.done.is_some()) {
+            self.fif.sel = Some((0, 0));
         }
         if self.fif.done.is_some() {
             self.fif.search = None;
@@ -1548,6 +1566,143 @@ impl App {
         tab.view.scroll_to_caret = true;
     }
 
+    /// Replace the matches in one open document as one undoable edit. Returns the count.
+    fn replace_in_doc(&mut self, tab: usize, re: &regex::Regex, only_line: Option<usize>) -> usize {
+        let (rep, expand) = (self.fif.replacement.clone(), self.fif.q.regex);
+        let doc = &mut self.tabs[tab].doc;
+        let text = doc.rope.to_string();
+        let reps = findfiles::replacements(re, &text, &rep, expand, only_line);
+        if reps.is_empty() {
+            return 0;
+        }
+        // keep the caret where it was, shifted by the replacements before it
+        let head = doc.rope.char_to_byte(doc.primary_sel().head);
+        let mut new_head = head as isize;
+        for (a, b, r) in &reps {
+            if *b <= head {
+                new_head += r.len() as isize - (b - a) as isize;
+            }
+        }
+        let edits = reps
+            .iter()
+            .map(|(a, b, r)| {
+                let n = r.chars().count();
+                Edit { start: doc.rope.byte_to_char(*a), end: doc.rope.byte_to_char(*b), text: r.clone(), anchor: n, head: n }
+            })
+            .collect();
+        doc.apply(EditKind::Other, edits);
+        let new_text = findfiles::apply(&text, &reps);
+        let mut h = (new_head.max(0) as usize).min(new_text.len());
+        while !new_text.is_char_boundary(h) {
+            h -= 1;
+        }
+        let c = doc.rope.byte_to_char(h);
+        doc.set_sels(vec![Sel::caret(c)], 0);
+        reps.len()
+    }
+
+    /// Replace in the selected result's line (opening its file), then move to the next one.
+    fn fif_replace_one(&mut self, ctx: &egui::Context) {
+        let Some((fi, hi)) = self.fif.sel else { return };
+        let Some((path, line)) = self.fif.results.get(fi).and_then(|f| f.hits.get(hi).map(|h| (f.path.clone(), h.line))) else {
+            return;
+        };
+        let re = match findfiles::build_regex(&self.fif.q) {
+            Ok(re) => re,
+            Err(e) => return self.set_status(ctx, e),
+        };
+        self.fif_open(fi, hi);
+        if self.tabs[self.active].doc.path.as_deref() != Some(path.as_path()) {
+            return;
+        }
+        let n = self.replace_in_doc(self.active, &re, Some(line));
+        self.tabs[self.active].view.scroll_to_caret = true;
+        self.set_status(ctx, format!("Replaced {n} in {} (unsaved; Ctrl+Z undoes)", file_name(&path)));
+        self.fif.resume = Some((path, line + 1));
+        self.fif.dirty_at = Some(0.0);
+    }
+
+    /// Ask before Replace All: count how many result files are open and how many would be
+    /// written to disk.
+    fn fif_ask_replace_all(&mut self, ctx: &egui::Context) {
+        if self.fif.search.is_some() {
+            return self.set_status(ctx, "Wait for the search to finish");
+        }
+        if matches!(self.fif.done, Some((_, true))) {
+            return self.set_status(ctx, "Too many matches to replace safely; narrow the search first");
+        }
+        let open = self.fif.results.iter().filter(|f| self.tabs.iter().any(|t| t.doc.path.as_ref() == Some(&f.path))).count();
+        self.fif.confirm = Some((open, self.fif.results.len() - open));
+    }
+
+    fn fif_replace_all(&mut self, ctx: &egui::Context) {
+        self.fif.confirm = None;
+        let re = match findfiles::build_regex(&self.fif.q) {
+            Ok(re) => re,
+            Err(e) => return self.set_status(ctx, e),
+        };
+        let (rep, expand) = (self.fif.replacement.clone(), self.fif.q.regex);
+        let paths: Vec<PathBuf> = self.fif.results.iter().map(|f| f.path.clone()).collect();
+        let (mut count, mut in_tabs, mut on_disk, mut failed) = (0, 0, 0, vec![]);
+        let mut undo = vec![];
+        for p in paths {
+            if let Some(t) = self.tabs.iter().position(|t| t.doc.path.as_ref() == Some(&p)) {
+                let n = self.replace_in_doc(t, &re, None);
+                count += n;
+                in_tabs += (n > 0) as usize;
+                continue;
+            }
+            // not open: rewrite the file (only valid UTF-8, so nothing gets mangled)
+            let Ok(before) = std::fs::read(&p).map_err(|_| ()).and_then(|b| String::from_utf8(b).map_err(|_| ())) else {
+                failed.push(file_name(&p));
+                continue;
+            };
+            let reps = findfiles::replacements(&re, &before, &rep, expand, None);
+            if reps.is_empty() {
+                continue;
+            }
+            let after = findfiles::apply(&before, &reps);
+            let tmp = p.with_extension("edit-replace.tmp");
+            match std::fs::write(&tmp, &after).and_then(|_| std::fs::rename(&tmp, &p)) {
+                Ok(()) => {
+                    count += reps.len();
+                    on_disk += 1;
+                    undo.push((p, before, after));
+                }
+                Err(_) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    failed.push(file_name(&p));
+                }
+            }
+        }
+        self.fif.undo = undo;
+        let mut msg = format!("Replaced {count} matches: {on_disk} files saved, {in_tabs} open files edited (unsaved)");
+        if !failed.is_empty() {
+            msg += &format!("; could not change {}", failed.join(", "));
+        }
+        self.set_status(ctx, msg);
+        self.fif.dirty_at = Some(0.0);
+    }
+
+    /// Put back the files Replace All wrote, unless they have changed since.
+    fn fif_undo_replace(&mut self, ctx: &egui::Context) {
+        let (mut restored, mut skipped) = (0, vec![]);
+        for (p, before, after) in std::mem::take(&mut self.fif.undo) {
+            let unchanged = std::fs::read_to_string(&p).is_ok_and(|now| now == after);
+            if unchanged && std::fs::write(&p, &before).is_ok() {
+                restored += 1;
+            } else {
+                skipped.push(file_name(&p));
+            }
+        }
+        let mut msg = format!("Restored {restored} files");
+        if !skipped.is_empty() {
+            msg += &format!("; skipped {} (changed since the replace)", skipped.join(", "));
+        }
+        self.set_status(ctx, msg + ". Use Ctrl+Z in open tabs.");
+        self.fif.dirty_at = Some(0.0);
+    }
+
     fn fif_step(&mut self, forward: bool) {
         let r = &self.fif.results;
         if r.is_empty() {
@@ -1573,7 +1728,9 @@ impl App {
     fn fif_panel(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let qid = Id::new("fif_query");
         let mid = Id::new("fif_mask");
-        if ctx.memory(|m| m.has_focus(qid) || m.has_focus(mid)) {
+        let rid = Id::new("fif_replacement");
+        let in_replace = ctx.memory(|m| m.has_focus(rid));
+        if ctx.memory(|m| m.has_focus(qid) || m.has_focus(mid)) || in_replace {
             let (esc, enter, up, down) = ctx.input_mut(|i| {
                 (
                     i.consume_key(Modifiers::NONE, Key::Escape),
@@ -1590,7 +1747,9 @@ impl App {
             if up || down {
                 self.fif_step(down);
             }
-            if enter {
+            if enter && in_replace {
+                self.fif_replace_one(ctx);
+            } else if enter {
                 if let Some((fi, hi)) = self.fif.sel {
                     self.fif_open(fi, hi);
                     self.focus_editor(ctx);
@@ -1642,10 +1801,56 @@ impl App {
                 if ui.button("×").on_hover_text("Close (Esc)").clicked() {
                     self.fif.open = false;
                 }
+                ui.toggle_value(&mut self.fif.replace, "Replace…").on_hover_text("Replace in Files (Ctrl+Shift+R)");
             });
         });
         if changed {
             self.fif.dirty_at = Some(ctx.input(|i| i.time));
+            self.fif.confirm = None;
+        }
+        if self.fif.replace {
+            ui.horizontal(|ui| {
+                ui.add_space(4.0);
+                ui.label("Replace with:");
+                ui.add(
+                    TextEdit::singleline(&mut self.fif.replacement)
+                        .id(rid)
+                        .desired_width(300.0)
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text(if self.fif.q.regex { "$1 inserts group 1   Enter: replace" } else { "Enter: replace selected line" }),
+                );
+                let ready = self.fif.sel.is_some() && self.fif.error.is_none();
+                if ui.add_enabled(ready, egui::Button::new("Replace")).on_hover_text("Replace in the selected line, then go to the next (Enter)").clicked() {
+                    self.fif_replace_one(ctx);
+                }
+                if ui.add_enabled(ready, egui::Button::new("Replace All…")).clicked() {
+                    self.fif_ask_replace_all(ctx);
+                }
+                if !self.fif.undo.is_empty()
+                    && ui.button("Undo Replace").on_hover_text("Restore the files Replace All saved").clicked()
+                {
+                    self.fif_undo_replace(ctx);
+                }
+            });
+            if let Some((open, disk)) = self.fif.confirm {
+                ui.horizontal(|ui| {
+                    ui.add_space(4.0);
+                    let mut msg = format!("Replace all matches in {} files?", open + disk);
+                    if disk > 0 {
+                        msg += &format!(" {disk} not open in the editor will be saved to disk (Undo Replace restores them).");
+                    }
+                    if open > 0 {
+                        msg += &format!(" {open} open files are edited without saving.");
+                    }
+                    ui.label(RichText::new(msg).color(c_warn()));
+                    if ui.button("Replace All").clicked() {
+                        self.fif_replace_all(ctx);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.fif.confirm = None;
+                    }
+                });
+            }
         }
         ui.add_space(4.0);
 
@@ -1976,7 +2181,7 @@ impl eframe::App for App {
                     }
                 });
                 ui.menu_button("Find", |ui| {
-                    for cmd in [Cmd::Find, Cmd::FindInFiles, Cmd::Replace, Cmd::FindNext, Cmd::FindPrev, Cmd::GotoAnything, Cmd::GotoLine, Cmd::GotoBracket] {
+                    for cmd in [Cmd::Find, Cmd::FindInFiles, Cmd::ReplaceInFiles, Cmd::Replace, Cmd::FindNext, Cmd::FindPrev, Cmd::GotoAnything, Cmd::GotoLine, Cmd::GotoBracket] {
                         item(ui, cmd, self);
                     }
                 });
@@ -2374,6 +2579,11 @@ fn git_head_text(path: &Path) -> Result<String, String> {
         return Err(format!("git: {}", err.lines().next().unwrap_or("file is not in HEAD").trim()));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Warning text colour (amber).
+fn c_warn() -> Color32 {
+    Color32::from_rgb(0xeb, 0xcb, 0x8b)
 }
 
 fn file_name(p: &Path) -> String {

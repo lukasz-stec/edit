@@ -64,6 +64,7 @@ On macOS, `Cmd` works wherever `Ctrl` is listed.
 | `Alt+1` | Toggle sidebar |
 | `Ctrl+F` / `Ctrl+H`, `Ctrl+R` | Find / replace |
 | `Ctrl+Shift+F` | Find in Files (all sidebar folders; ↑↓ and Enter to open a result) |
+| `Ctrl+Shift+R` | Replace in Files (open files are edited unsaved; others are saved, with Undo Replace) |
 | `F3` / `Shift+F3` | Next / previous match |
 | `Ctrl+M`, `Ctrl+Shift+M` | Go to matching bracket |
 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Zoom in / out / reset |

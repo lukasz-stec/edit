@@ -137,6 +137,47 @@ pub fn search_text(re: &Regex, text: &str, budget: usize) -> Vec<Hit> {
     hits
 }
 
+/// Replacements for the matches in `text`, line by line exactly like the search: (byte
+/// start, byte end, new text). With `expand` (regex mode), `$1` / `${name}` in `rep` insert
+/// capture groups. `only_line` limits it to one 0-based line.
+pub fn replacements(re: &Regex, text: &str, rep: &str, expand: bool, only_line: Option<usize>) -> Vec<(usize, usize, String)> {
+    let mut out = vec![];
+    let mut off = 0;
+    for (no, seg) in text.split('\n').enumerate() {
+        if only_line.map_or(true, |l| l == no) {
+            let body = seg.strip_suffix('\r').unwrap_or(seg);
+            for caps in re.captures_iter(body) {
+                let m = caps.get(0).unwrap();
+                if m.end() == m.start() {
+                    continue;
+                }
+                let new = if expand {
+                    let mut s = String::new();
+                    caps.expand(rep, &mut s);
+                    s
+                } else {
+                    rep.to_string()
+                };
+                out.push((off + m.start(), off + m.end(), new));
+            }
+        }
+        off += seg.len() + 1;
+    }
+    out
+}
+
+pub fn apply(text: &str, reps: &[(usize, usize, String)]) -> String {
+    let mut s = String::with_capacity(text.len());
+    let mut at = 0;
+    for (a, b, r) in reps {
+        s.push_str(&text[at..*a]);
+        s.push_str(r);
+        at = *b;
+    }
+    s.push_str(&text[at..]);
+    s
+}
+
 /// Start searching `files` (open buffers' text in `buffers` wins over the disk copy).
 pub fn start(
     files: Vec<PathBuf>,
@@ -222,6 +263,18 @@ mod tests {
         assert_eq!(h.preview, "let fóo = Foo + foo;");
         assert_eq!(h.ranges.len(), 2);
         assert_eq!(&h.preview[h.ranges[1].0..h.ranges[1].1], "foo");
+    }
+
+    #[test]
+    fn replace_keeps_line_endings_and_expands_groups() {
+        let q = Query { text: r"(\w+)_id".into(), regex: true, ..Default::default() };
+        let re = build_regex(&q).unwrap();
+        let text = "user_id = 1\r\nlet x = group_id;\r\n";
+        let reps = replacements(&re, text, "${1}Id", true, None);
+        assert_eq!(apply(text, &reps), "userId = 1\r\nlet x = groupId;\r\n");
+        // one line only, and literal text when not expanding
+        let reps = replacements(&re, text, "$1", false, Some(1));
+        assert_eq!(apply(text, &reps), "user_id = 1\r\nlet x = $1;\r\n");
     }
 
     #[test]
