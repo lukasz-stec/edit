@@ -1,5 +1,6 @@
 //! The editor widget: custom painting of text, carets, selections, gutter, minimap.
 
+use crate::diff::{Hunk, Kind};
 use crate::doc::{rect_sels, Block, Document};
 use crate::highlight::{Colors, LineCache, Syntax};
 use crate::selection::Sel;
@@ -50,6 +51,8 @@ pub struct View {
     /// Layout from the last frame (used to link the diff panes).
     pub text_rect: Rect,
     pub line_height: f32,
+    /// A gutter change marker was clicked: (index into `Ctx::vcs`, where).
+    pub vcs_click: Option<(usize, Pos2)>,
 }
 
 impl View {
@@ -68,6 +71,7 @@ impl View {
             sb_drag: None,
             text_rect: Rect::NOTHING,
             line_height: 20.0,
+            vcs_click: None,
         }
     }
 }
@@ -98,6 +102,8 @@ pub struct Ctx<'a> {
     pub find: &'a [(usize, usize)],
     pub id: Id,
     pub decor: Option<&'a Decor>,
+    /// Changes against Git HEAD, drawn as gutter markers (left = HEAD, right = this text).
+    pub vcs: &'a [Hunk],
 }
 
 const MINIMAP_W: f32 = 110.0;
@@ -208,7 +214,18 @@ pub fn show(ui: &mut Ui, doc: &mut Document, view: &mut View, cx: &Ctx) -> Respo
                     doc.add_caret_at(pos);
                 }
             };
-            if gutter.contains(p) {
+            let vcs_hit = (gutter.contains(p) && p.x >= gutter.right() - cw * 1.2)
+                .then(|| {
+                    cx.vcs.iter().position(|h| match h.kind {
+                        Kind::Delete => line == h.right.start || line + 1 == h.right.start,
+                        _ => h.right.contains(&line),
+                    })
+                })
+                .flatten();
+            if let Some(i) = vcs_hit {
+                // IntelliJ: clicking a change marker shows what was there before
+                view.vcs_click = Some((i, p));
+            } else if gutter.contains(p) {
                 let a = rope.line_to_char(line);
                 let b = if line + 1 < nlines { rope.line_to_char(line + 1) } else { rope.len_chars() };
                 let s = Sel::new(a, b);
@@ -676,6 +693,25 @@ pub fn show(ui: &mut Ui, doc: &mut Document, view: &mut View, cx: &Ctx) -> Respo
             if active { c.gutter_fg_active } else { c.gutter_fg },
         );
     }
+    // Git change markers: a bar for added/modified lines, a wedge where lines were deleted
+    let x = gutter.right() - cw * 0.85;
+    for h in cx.vcs {
+        if h.right.end < first || h.right.start > last {
+            continue;
+        }
+        let col = vcs_color(h.kind);
+        if h.kind == Kind::Delete {
+            let y = y_of(h.right.start);
+            gp.add(egui::Shape::convex_polygon(
+                vec![pos2(x - 1.0, y - 4.0), pos2(x + 5.0, y), pos2(x - 1.0, y + 4.0)],
+                col,
+                Stroke::NONE,
+            ));
+        } else {
+            let r = Rect::from_min_max(pos2(x, y_of(h.right.start) + 1.0), pos2(x + 3.0, y_of(h.right.end) - 1.0));
+            gp.rect_filled(r, 1.0, col);
+        }
+    }
 
     // scrollbar
     let (ty0, th) = thumb(sb_rect, view.scroll.y, max_scroll_y, vis_h);
@@ -701,6 +737,9 @@ pub fn show(ui: &mut Ui, doc: &mut Document, view: &mut View, cx: &Ctx) -> Respo
             for &(l, col) in d.marks.iter().take(5000) {
                 mark(l, col.to_opaque());
             }
+        }
+        for h in cx.vcs.iter().take(5000) {
+            mark(h.right.start, vcs_color(h.kind));
         }
         if doc.sels.len() < 5000 {
             for s in &doc.sels {
@@ -777,4 +816,13 @@ fn thumb(sb: Rect, scroll_y: f32, max_scroll: f32, vis_h: f32) -> (f32, f32) {
     let th = (sb.height() * vis_h / content.max(1.0)).clamp(24.0, sb.height());
     let frac = if max_scroll > 0.0 { scroll_y / max_scroll } else { 0.0 };
     (sb.top() + frac * (sb.height() - th), th)
+}
+
+/// Gutter marker colours, as in IntelliJ: added green, modified blue, deleted grey-red.
+pub fn vcs_color(kind: Kind) -> Color32 {
+    match kind {
+        Kind::Insert => Color32::from_rgb(0x55, 0x9b, 0x4f),
+        Kind::Replace => Color32::from_rgb(0x43, 0x80, 0xb8),
+        Kind::Delete => Color32::from_rgb(0xb0, 0x5a, 0x5a),
+    }
 }

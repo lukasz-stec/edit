@@ -48,6 +48,9 @@ Pass files or a folder on the command line: `edit path/to/project path/to/file.r
 - **Git status in the sidebar** like IntelliJ: modified (blue), added (green), untracked (red),
   ignored (olive) and conflicted files; folders show their changes; the branch is in the
   status bar. Refreshed in the background when files or the repository change.
+- **Git change markers in the gutter**: added (green), modified (blue) and deleted lines
+  against Git HEAD, live as you type; click a marker to see the original lines, roll them
+  back, or open the full diff.
 - **Follows the disk**: the sidebar updates when files are created, deleted or renamed,
   and open files reload when another program changes them (your unsaved edits are
   never overwritten; you get a warning instead).

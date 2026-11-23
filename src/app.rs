@@ -116,6 +116,22 @@ enum HistCompare {
 }
 
 /// Local History window (IntelliJ-style): versions on the left, a read-only diff on the right.
+enum Head {
+    Loading(std::sync::mpsc::Receiver<Option<ropey::Rope>>),
+    /// None: not in HEAD (new file) or not in a repository.
+    Ready(Option<ropey::Rope>),
+}
+
+/// Popup for a clicked gutter change marker: what the lines were in HEAD.
+struct VcsPopup {
+    doc: u64,
+    version: u64,
+    hunk: crate::diff::Hunk,
+    at: egui::Pos2,
+    /// The mouse button that opened it has been released (until then, ignore "click elsewhere").
+    armed: bool,
+}
+
 struct HistView {
     /// The file, or the folder whose files are listed.
     target: PathBuf,
@@ -206,6 +222,13 @@ pub struct App {
     git_dirty_at: Option<f64>,
     /// Sidebar folders the git status was last computed for.
     git_roots: Vec<PathBuf>,
+    /// Git HEAD version of files, for the gutter change markers (loaded in the background).
+    heads: HashMap<PathBuf, Head>,
+    /// Bumped when HEAD versions are reloaded, so markers get recomputed.
+    heads_gen: u64,
+    /// Gutter markers per document id: ((doc version, heads_gen), changes, computed at).
+    vcs_marks: HashMap<u64, ((u64, u64), Vec<crate::diff::Hunk>, f64)>,
+    vcs_popup: Option<VcsPopup>,
     history: History,
     /// File and versions listed by the Local History palette.
     /// Local History window, shown instead of the editor while open.
@@ -269,6 +292,10 @@ impl App {
             git: git::GitWatch::new(),
             git_dirty_at: Some(0.0),
             git_roots: vec![],
+            heads: HashMap::new(),
+            heads_gen: 0,
+            vcs_marks: HashMap::new(),
+            vcs_popup: None,
             history: History::start(),
             hist: None,
         };
@@ -2277,6 +2304,137 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------ git gutter markers
+
+    /// Keep the active file's change markers (against Git HEAD) up to date: HEAD is loaded
+    /// once in the background, and the diff is recomputed at most every 150 ms while typing.
+    fn vcs_update(&mut self, ctx: &egui::Context) {
+        let doc = &self.tabs[self.active].doc;
+        let (id, version) = (doc.id, doc.version);
+        let Some(path) = doc.path.clone() else { return };
+        // only tracked files: untracked, ignored and newly added ones have no HEAD version
+        let tracked = self.git.roots.keys().any(|r| path.starts_with(r))
+            && !matches!(self.git.file(&path), Some(git::Status::Untracked | git::Status::Ignored | git::Status::Added));
+        if !tracked {
+            self.vcs_marks.remove(&id);
+            return;
+        }
+        match self.heads.get_mut(&path) {
+            None => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let (p, c) = (path.clone(), ctx.clone());
+                std::thread::spawn(move || {
+                    let head = git_head_text(&p).ok().map(|t| {
+                        let t = t.strip_prefix('\u{feff}').unwrap_or(&t);
+                        ropey::Rope::from_str(&t.replace("\r\n", "\n"))
+                    });
+                    let _ = tx.send(head);
+                    c.request_repaint();
+                });
+                self.heads.insert(path, Head::Loading(rx));
+                return;
+            }
+            Some(Head::Loading(rx)) => match rx.try_recv() {
+                Ok(head) => *self.heads.get_mut(&path).unwrap() = Head::Ready(head),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(_) => *self.heads.get_mut(&path).unwrap() = Head::Ready(None),
+            },
+            Some(Head::Ready(_)) => {}
+        }
+        let Some(Head::Ready(Some(head))) = self.heads.get(&path) else {
+            self.vcs_marks.remove(&id);
+            return;
+        };
+        let key = (version, self.heads_gen);
+        let now = ctx.input(|i| i.time);
+        match self.vcs_marks.get(&id) {
+            Some((k, _, _)) if *k == key => return,
+            Some((_, _, at)) if now - at < 0.15 => {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(0.16 - (now - at)));
+                return;
+            }
+            _ => {}
+        }
+        let doc = &self.tabs[self.active].doc;
+        if doc.rope.len_chars() > 4_000_000 {
+            return;
+        }
+        let hunks = crate::diff::compute_lines(head, &doc.rope);
+        self.vcs_marks.insert(id, (key, hunks, now));
+    }
+
+    /// Popup for a clicked change marker: the lines as they are in HEAD, Rollback, Show Diff.
+    fn vcs_popup_ui(&mut self, ctx: &egui::Context) {
+        let Some(pp) = &self.vcs_popup else { return };
+        let doc = &self.tabs[self.active].doc;
+        let head = doc.path.as_ref().and_then(|p| match self.heads.get(p) {
+            Some(Head::Ready(Some(h))) => Some(h.clone()),
+            _ => None,
+        });
+        // the change must still be the same: same document, unedited since the click
+        let (Some(head), true) = (head, pp.doc == doc.id && pp.version == doc.version) else {
+            self.vcs_popup = None;
+            return;
+        };
+        let h = pp.hunk.clone();
+        let old = head.slice(crate::diff::line_pos(&head, h.left.start)..crate::diff::line_pos(&head, h.left.end)).to_string();
+        let (mut rollback, mut show_diff, mut close) = (false, false, false);
+        let c = self.colors.clone();
+        let font = FontId::monospace(self.settings.font_size - 1.0);
+        let area = egui::Area::new(Id::new("vcs_popup"))
+            .fixed_pos(pp.at + vec2(14.0, -8.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                Frame::popup(ui.style()).inner_margin(Margin::same(8.0)).show(ui, |ui| {
+                    ui.set_max_width(700.0);
+                    ui.horizontal(|ui| {
+                        let what = match h.kind {
+                            crate::diff::Kind::Insert => format!("{} added line(s)", h.right.len()),
+                            crate::diff::Kind::Delete => format!("{} deleted line(s)", h.left.len()),
+                            crate::diff::Kind::Replace => format!("{} changed line(s)", h.right.len()),
+                        };
+                        ui.label(RichText::new(what).color(editor::vcs_color(h.kind)).strong());
+                        rollback = ui.button("Rollback").on_hover_text("Restore these lines as they are in Git HEAD (Ctrl+Z undoes)").clicked();
+                        show_diff = ui.button("Show Diff").on_hover_text("Compare the whole file with Git HEAD").clicked();
+                        close = ui.small_button("×").clicked();
+                    });
+                    if !old.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("In HEAD:").small().weak());
+                        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                            let text = old.strip_suffix('\n').unwrap_or(&old);
+                            let mut job = LayoutJob::default();
+                            job.append(
+                                text,
+                                0.0,
+                                TextFormat { font_id: font.clone(), color: c.fg, background: Color32::from_rgba_unmultiplied(0xb0, 0x5a, 0x5a, 40), ..Default::default() },
+                            );
+                            ui.label(job);
+                        });
+                    }
+                });
+            });
+        let esc = ctx.input(|i| i.key_pressed(Key::Escape));
+        let armed = self.vcs_popup.as_ref().is_some_and(|p| p.armed);
+        if close || esc || (armed && area.response.clicked_elsewhere()) {
+            self.vcs_popup = None;
+        } else if !armed && !ctx.input(|i| i.pointer.any_down()) {
+            if let Some(p) = self.vcs_popup.as_mut() {
+                p.armed = true;
+            }
+        }
+        if rollback {
+            let tab = &mut self.tabs[self.active];
+            diffview::revert(&mut tab.doc, &head, &h);
+            tab.view.scroll_to_caret = true;
+            self.vcs_popup = None;
+        }
+        if show_diff {
+            self.vcs_popup = None;
+            self.run_global(ctx, Cmd::DiffWithHead);
+        }
+    }
+
     // ------------------------------------------------------------ external changes
 
     /// Follow changes on disk: refresh the tree and reload open files that changed.
@@ -2322,7 +2480,11 @@ impl App {
             }
         }
         // git status: refreshed in the background after changes settle, one run at a time
-        self.git.poll();
+        if self.git.poll() {
+            // commits, checkouts etc.: reload the HEAD versions behind the gutter markers
+            self.heads.clear();
+            self.heads_gen += 1;
+        }
         if self.git_roots != self.roots {
             self.git_roots = self.roots.clone();
             self.git_dirty_at = Some(0.0);
@@ -2530,6 +2692,7 @@ impl eframe::App for App {
         }
 
         self.sync_fs(ctx);
+        self.vcs_update(ctx);
         self.handle_input(ctx);
         self.refresh_find();
         let c = self.colors.clone();
@@ -2793,6 +2956,7 @@ impl eframe::App for App {
                     ui.memory_mut(|m| m.request_focus(self.editor_id));
                 }
             } else {
+                let vcs: &[crate::diff::Hunk] = self.vcs_marks.get(&tab.doc.id).map_or(&[], |m| &m.1);
                 let cx = editor::Ctx {
                     syn: &self.syn,
                     theme,
@@ -2801,14 +2965,21 @@ impl eframe::App for App {
                     find,
                     id: self.editor_id,
                     decor: None,
+                    vcs,
                 };
                 let resp = editor::show(ui, &mut tab.doc, &mut tab.view, &cx);
+                if let Some((i, at)) = tab.view.vcs_click.take() {
+                    if let Some(h) = vcs.get(i) {
+                        self.vcs_popup = Some(VcsPopup { doc: tab.doc.id, version: tab.doc.version, hunk: h.clone(), at, armed: false });
+                    }
+                }
                 if std::mem::take(&mut self.startup_focus) {
                     resp.request_focus();
                 }
             }
         });
 
+        self.vcs_popup_ui(ctx);
         self.palette_ui(ctx);
         self.dialogs(ctx);
 

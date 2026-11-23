@@ -36,6 +36,15 @@ pub fn line_pos(rope: &Rope, line: usize) -> usize {
 }
 
 pub fn compute(left: &Rope, right: &Rope) -> Vec<Hunk> {
+    compute_with(left, right, true)
+}
+
+/// Line hunks only, without the word-level detail (for the gutter markers).
+pub fn compute_lines(left: &Rope, right: &Rope) -> Vec<Hunk> {
+    compute_with(left, right, false)
+}
+
+fn compute_with(left: &Rope, right: &Rope, words: bool) -> Vec<Hunk> {
     let a = left.to_string();
     let b = right.to_string();
     let diff = TextDiff::configure()
@@ -70,7 +79,7 @@ pub fn compute(left: &Rope, right: &Rope) -> Vec<Hunk> {
         } else {
             Kind::Replace
         };
-        if h.kind == Kind::Replace {
+        if words && h.kind == Kind::Replace {
             inline_words(left, right, h);
         }
     }

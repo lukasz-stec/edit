@@ -65,7 +65,7 @@ impl DiffState {
 }
 
 /// Replace the right side of a change with the left side (undoable).
-fn revert(doc: &mut Document, left: &ropey::Rope, h: &Hunk) {
+pub fn revert(doc: &mut Document, left: &ropey::Rope, h: &Hunk) {
     let text = left.slice(line_pos(left, h.left.start)..line_pos(left, h.left.end)).to_string();
     let (rs, re) = (line_pos(&doc.rope, h.right.start), line_pos(&doc.rope, h.right.end));
     doc.set_sels(vec![Sel::caret(rs)], 0);
@@ -213,6 +213,7 @@ pub fn show(ui: &mut egui::Ui, right: &mut Document, view: &mut View, st: &mut D
         find,
         id,
         decor: Some(decor),
+        vcs: &[],
     };
     ui.allocate_new_ui(UiBuilder::new().max_rect(lrect), |ui| {
         editor::show(ui, &mut st.left, &mut st.left_view, &mk(cx.left_id, &[], &ldec));
