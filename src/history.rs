@@ -145,22 +145,27 @@ impl History {
         v
     }
 
-    /// Versions of every file under `dir` (including files deleted since), newest first.
-    pub fn versions_under(&self, dir: &Path, limit: usize) -> Vec<(PathBuf, Version)> {
+    /// Change sets of `path`, newest first.
+    pub fn change_sets_of(&self, path: &Path) -> Vec<ChangeSet> {
+        let mut v = self.versions(path);
+        v.reverse();
+        change_sets(vec![(path.to_path_buf(), v)])
+    }
+
+    /// Change sets touching files under `dir` (including files deleted since), newest first.
+    pub fn change_sets_under(&self, dir: &Path) -> Vec<ChangeSet> {
         let Some(root) = &self.dir else { return vec![] };
-        let mut out = vec![];
+        let mut logs = vec![];
         if let Ok(rd) = std::fs::read_dir(root.join("index")) {
             for e in rd.flatten() {
                 if let Some((file, versions)) = read_log(&e.path()) {
                     if file.starts_with(dir) {
-                        out.extend(versions.into_iter().map(|v| (file.clone(), v)));
+                        logs.push((file, versions));
                     }
                 }
             }
         }
-        out.sort_by(|a, b| b.1.time.cmp(&a.1.time));
-        out.truncate(limit);
-        out
+        change_sets(logs)
     }
 
     pub fn load(&self, v: &Version) -> Option<String> {
@@ -279,6 +284,94 @@ fn prune_daily(root: &Path) {
     }
 }
 
+// ------------------------------------------------------------------ change sets
+
+/// Changes this close together (and not further apart from the first) form one change set.
+const SET_GAP_MS: u64 = 3 * 60 * 1000;
+const SET_SPAN_MS: u64 = 15 * 60 * 1000;
+/// The files of one Replace in Files are recorded within moments of each other.
+const REPLACE_GAP_MS: u64 = 2000;
+
+/// How one file changed within a change set.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileChange {
+    pub path: PathBuf,
+    /// The file before the set, and after it.
+    pub before: Version,
+    pub after: Version,
+    /// Versions recorded for this file in the set.
+    pub count: usize,
+}
+
+/// Changes made together: one Replace in Files, or edits within a few minutes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChangeSet {
+    pub start: u64,
+    pub end: u64,
+    pub replace: bool,
+    /// The distinct events recorded in the set.
+    pub events: Vec<String>,
+    /// Sorted by path.
+    pub files: Vec<FileChange>,
+}
+
+impl ChangeSet {
+    /// "Replace in Files", "Saved", "Changed on disk"… or "Changes" when mixed.
+    pub fn label(&self) -> &'static str {
+        if self.replace {
+            return "Replace in Files";
+        }
+        match self.events.as_slice() {
+            [one] => Event::label(one),
+            _ => "Changes",
+        }
+    }
+}
+
+/// Group the version logs of files into change sets, newest first. A file's first version
+/// is its baseline (usually from opening it), not a change, so it starts no set.
+pub fn change_sets(logs: Vec<(PathBuf, Vec<Version>)>) -> Vec<ChangeSet> {
+    // every version with a predecessor is a change: (time, path, before, after)
+    let mut changes: Vec<(u64, PathBuf, Version, Version)> = vec![];
+    for (path, mut versions) in logs {
+        versions.sort_by_key(|v| v.time);
+        for w in versions.windows(2) {
+            changes.push((w[1].time, path.clone(), w[0].clone(), w[1].clone()));
+        }
+    }
+    changes.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let mut sets: Vec<ChangeSet> = vec![];
+    for (time, path, before, after) in changes {
+        let replace = after.event == Event::Replaced.tag();
+        let joins = sets.last().is_some_and(|s| {
+            s.replace == replace
+                && time.saturating_sub(s.end) <= if replace { REPLACE_GAP_MS } else { SET_GAP_MS }
+                && (replace || time.saturating_sub(s.start) <= SET_SPAN_MS)
+        });
+        if !joins {
+            sets.push(ChangeSet { start: time, end: time, replace, events: vec![], files: vec![] });
+        }
+        let s = sets.last_mut().unwrap();
+        s.end = time;
+        if !s.events.contains(&after.event) {
+            s.events.push(after.event.clone());
+        }
+        match s.files.iter_mut().find(|f| f.path == path) {
+            Some(f) => {
+                f.after = after;
+                f.count += 1;
+            }
+            None => s.files.push(FileChange { path, before, after, count: 1 }),
+        }
+    }
+    for s in &mut sets {
+        s.files.sort_by(|a, b| a.path.cmp(&b.path));
+    }
+    sets.reverse();
+    sets
+}
+
+
 // ------------------------------------------------------------------ time display
 
 static LOCAL_OFFSET: OnceLock<time::UtcOffset> = OnceLock::new();
@@ -338,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn folder_history_lists_files_below_newest_first() {
+    fn folder_change_sets_skip_baselines_and_group_by_time() {
         let root = std::env::temp_dir().join(format!("edit-history-dir-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("blobs")).unwrap();
@@ -346,19 +439,51 @@ mod tests {
         let mut last = HashMap::new();
         let proj = PathBuf::from("/proj");
         let text = |s: &str| Rope::from_str(s);
-        write_version(&root, &mut last, &proj.join("a.rs"), &text("a1"), Event::Saved, 10).unwrap();
-        write_version(&root, &mut last, &proj.join("sub").join("b.rs"), &text("b1"), Event::Saved, 30).unwrap();
-        write_version(&root, &mut last, &proj.join("a.rs"), &text("a2"), Event::Saved, 20).unwrap();
-        write_version(&root, &mut last, Path::new("/project-other/c.rs"), &text("c1"), Event::Saved, 40).unwrap();
+        let min = 60_000;
+        let mut w = |p: &Path, s: &str, e: Event, t: u64| write_version(&root, &mut last, p, &text(s), e, t).unwrap();
+        let (a, b, c) = (proj.join("a.rs"), proj.join("sub").join("b.rs"), proj.join("c.rs"));
+        w(&a, "a0", Event::Opened, 0);
+        w(&b, "b0", Event::Opened, 0);
+        w(&c, "c0", Event::Opened, 0); // only opened: never listed
+        w(&a, "a1", Event::Saved, 10 * min);
+        w(&a, "a2", Event::Saved, 11 * min);
+        w(&b, "b1", Event::Saved, 12 * min); // same set: within 3 minutes
+        w(&a, "a3", Event::Saved, 30 * min); // new set
+        w(&a, "a3x", Event::BeforeReplace, 30 * min + 500); // joins: edits right before the replace
+        w(&a, "a4", Event::Replaced, 30 * min + 600); // a replace is its own set
+        w(&b, "b2", Event::Replaced, 30 * min + 700);
+        w(Path::new("/project-other/x.rs"), "x0", Event::Opened, 0);
+        w(Path::new("/project-other/x.rs"), "x1", Event::Saved, 12 * min);
         let h = History { dir: Some(root.clone()), tx: None, worker: None };
-        let got: Vec<(String, u64)> = h
-            .versions_under(&proj, 100)
-            .into_iter()
-            .map(|(p, v)| (p.strip_prefix(&proj).unwrap().to_string_lossy().replace('\\', "/"), v.time))
-            .collect();
-        // "/project-other" shares the text prefix but is not inside /proj
-        assert_eq!(got, vec![("sub/b.rs".into(), 30), ("a.rs".into(), 20), ("a.rs".into(), 10)]);
+        let sets = h.change_sets_under(&proj);
+        let show = |s: &ChangeSet| {
+            let files: Vec<String> = s.files.iter().map(|f| {
+                let rel = f.path.strip_prefix(&proj).unwrap().to_string_lossy().replace('\\', "/");
+                format!("{rel}:{}>{}", h.load(&f.before).unwrap(), h.load(&f.after).unwrap())
+            }).collect();
+            (s.label(), files.join(" "))
+        };
+        assert_eq!(
+            sets.iter().map(show).collect::<Vec<_>>(),
+            vec![
+                ("Replace in Files", "a.rs:a3x>a4 sub/b.rs:b1>b2".to_string()),
+                ("Changes", "a.rs:a2>a3x".to_string()),
+                ("Saved", "a.rs:a0>a2 sub/b.rs:b0>b1".to_string()),
+            ]
+        );
+        assert_eq!(h.change_sets_of(&c), vec![]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn long_editing_sessions_are_split() {
+        let v = |t: u64| Version { time: t * 60_000, event: "saved".into(), blob: format!("{t}"), chars: 1 };
+        // a save every 2 minutes for 40 minutes: no gap, but sets span at most 15 minutes
+        let sets = change_sets(vec![(PathBuf::from("/a"), (0..=20).map(|i| v(i * 2)).collect())]);
+        assert_eq!(sets.len(), 3);
+        assert!(sets.iter().all(|s| s.end - s.start <= SET_SPAN_MS));
+        assert_eq!(sets[0].label(), "Saved");
+        assert_eq!(sets.iter().map(|s| s.files[0].count).sum::<usize>(), 20);
     }
 
     #[test]

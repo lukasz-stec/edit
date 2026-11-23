@@ -136,12 +136,14 @@ struct HistView {
     /// The file, or the folder whose files are listed.
     target: PathBuf,
     folder: bool,
-    entries: Vec<(PathBuf, history::Version)>,
-    sel: usize,
+    /// Change sets, newest first.
+    sets: Vec<history::ChangeSet>,
+    /// Selected (change set, file in it).
+    sel: (usize, usize),
     compare: HistCompare,
     filter: String,
     /// Diff for `(sel, compare)`: the diff state and its right side.
-    shown: Option<((usize, HistCompare), DiffState, Document, View)>,
+    shown: Option<(((usize, usize), HistCompare), DiffState, Document, View)>,
     focus_list: bool,
     scroll_to_sel: bool,
 }
@@ -1477,26 +1479,19 @@ impl App {
         self.open_history(ctx, path, false);
     }
 
-    fn history_entries(&self, target: &Path, folder: bool) -> Vec<(PathBuf, history::Version)> {
-        if folder {
-            self.history.versions_under(target, 5000)
-        } else {
-            self.history.versions(target).into_iter().map(|v| (target.to_path_buf(), v)).collect()
-        }
-    }
-
     fn open_history(&mut self, ctx: &egui::Context, target: PathBuf, folder: bool) {
-        let entries = self.history_entries(&target, folder);
-        if entries.is_empty() {
-            return self.set_status(ctx, format!("No local history for {} yet", file_name(&target)));
+        let mut sets = if folder { self.history.change_sets_under(&target) } else { self.history.change_sets_of(&target) };
+        sets.truncate(2000);
+        if sets.is_empty() {
+            return self.set_status(ctx, format!("No local changes recorded for {} yet", file_name(&target)));
         }
         self.palette = None;
         self.hist = Some(HistView {
             target,
             folder,
-            entries,
-            sel: 0,
-            compare: HistCompare::Current,
+            sets,
+            sel: (0, 0),
+            compare: HistCompare::Previous,
             filter: String::new(),
             shown: None,
             focus_list: true,
@@ -1514,36 +1509,33 @@ impl App {
         Some(text.strip_prefix('\u{feff}').unwrap_or(&text).replace("\r\n", "\n"))
     }
 
-    /// Build the diff for the selected version, unless it's already shown.
+    /// Build the diff for the selected file of the selected change set, unless it's shown.
     fn hist_build(&mut self) {
         let Some(h) = &self.hist else { return };
         let key = (h.sel, h.compare);
         if h.shown.as_ref().is_some_and(|s| s.0 == key) {
             return;
         }
-        let Some((path, v)) = h.entries.get(h.sel).cloned() else { return };
+        let Some(fc) = hist_selected(h).cloned() else { return };
         let label = |v: &history::Version| {
             let (time, day) = history::format_time(v.time);
             format!("{day} {time} · {}", history::Event::label(&v.event))
         };
-        let this = self.history.load(&v).unwrap_or_default();
+        let after = self.history.load(&fc.after).unwrap_or_default();
         let (left, left_title, right, right_title) = match h.compare {
             HistCompare::Current => {
-                let (now, title) = match self.current_text(&path) {
+                let (now, title) = match self.current_text(&fc.path) {
                     Some(t) => (t, "Current".to_string()),
                     None => (String::new(), "Current: file deleted".to_string()),
                 };
-                (this, label(&v), now, title)
+                (after, label(&fc.after), now, title)
             }
             HistCompare::Previous => {
-                let all = self.history.versions(&path); // newest first
-                let prev = all.iter().position(|x| *x == v).and_then(|i| all.get(i + 1));
-                match prev {
-                    Some(p) => (self.history.load(p).unwrap_or_default(), label(p), this, label(&v)),
-                    None => (String::new(), "(no earlier version)".to_string(), this, label(&v)),
-                }
+                let before = self.history.load(&fc.before).unwrap_or_default();
+                (before, format!("Before: {}", label(&fc.before)), after, label(&fc.after))
             }
         };
+        let path = fc.path;
         let mut doc = Document::from_str(&right);
         doc.path = Some(path.clone());
         doc.camel_humps = self.camel_humps;
@@ -1555,37 +1547,72 @@ impl App {
         }
     }
 
-    /// Make the selected version the file's content: an undoable edit if the file is open,
-    /// otherwise written to disk (recreating a deleted file).
-    fn hist_revert(&mut self, ctx: &egui::Context) {
-        let Some((path, v)) = self.hist.as_ref().and_then(|h| h.entries.get(h.sel).cloned()) else { return };
-        let Some(text) = self.history.load(&v) else {
-            return self.set_status(ctx, "This version is no longer stored");
-        };
-        let (time, day) = history::format_time(v.time);
-        if let Some(t) = self.tabs.iter().position(|t| t.doc.path.as_ref() == Some(&path)) {
+    /// Make `text` the content of `path`: an undoable edit if the file is open (Ok(true)),
+    /// otherwise written to disk, recreating a deleted file (Ok(false)).
+    fn restore_text(&mut self, path: &Path, text: String) -> Result<bool, String> {
+        if let Some(t) = self.tabs.iter().position(|t| t.doc.path.as_deref() == Some(path)) {
             let doc = &mut self.tabs[t].doc;
+            if doc.rope == text.as_str() {
+                return Ok(true);
+            }
             let end = doc.rope.len_chars();
             let head = doc.primary_sel().head;
             doc.apply(EditKind::Other, vec![Edit { start: 0, end, text, anchor: 0, head: 0 }]);
             let c = head.min(doc.rope.len_chars());
             doc.set_sels(vec![Sel::caret(c)], 0);
-            self.set_status(ctx, format!("{} reverted to {day} {time} (unsaved; Ctrl+Z undoes)", file_name(&path)));
-        } else {
-            // keep the file's line endings
-            let crlf = std::fs::read(&path).is_ok_and(|b| b.windows(2).any(|w| w == b"\r\n"));
-            let out = if crlf { text.replace('\n', "\r\n") } else { text.clone() };
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if let Err(e) = std::fs::write(&path, out) {
-                return self.set_status(ctx, format!("Could not write {}: {e}", path.display()));
-            }
-            self.history.record_str(&path, &text, history::Event::Reverted);
-            self.set_status(ctx, format!("{} reverted to {day} {time} and saved", file_name(&path)));
+            return Ok(true);
+        }
+        // keep the file's line endings
+        let crlf = std::fs::read(path).is_ok_and(|b| b.windows(2).any(|w| w == b"\r\n"));
+        let out = if crlf { text.replace('\n', "\r\n") } else { text.clone() };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        std::fs::write(path, out).map_err(|e| format!("Could not write {}: {e}", path.display()))?;
+        self.history.record_str(path, &text, history::Event::Reverted);
+        Ok(false)
+    }
+
+    /// Make the selected file's version (after the selected change set) its content.
+    fn hist_revert(&mut self, ctx: &egui::Context) {
+        let Some(fc) = self.hist.as_ref().and_then(hist_selected).cloned() else { return };
+        let Some(text) = self.history.load(&fc.after) else {
+            return self.set_status(ctx, "This version is no longer stored");
+        };
+        let (time, day) = history::format_time(fc.after.time);
+        let name = file_name(&fc.path);
+        match self.restore_text(&fc.path, text) {
+            Ok(true) => self.set_status(ctx, format!("{name} reverted to {day} {time} (unsaved; Ctrl+Z undoes)")),
+            Ok(false) => self.set_status(ctx, format!("{name} reverted to {day} {time} and saved")),
+            Err(e) => self.set_status(ctx, e),
         }
         if let Some(h) = self.hist.as_mut() {
             h.shown = None; // the current side changed
+        }
+    }
+
+    /// Put every file of the selected change set back as it was before the set.
+    fn hist_revert_set(&mut self, ctx: &egui::Context) {
+        let Some(set) = self.hist.as_ref().and_then(|h| h.sets.get(h.sel.0)).cloned() else { return };
+        let (mut in_tabs, mut on_disk, mut failed) = (0, 0, vec![]);
+        for fc in &set.files {
+            let res = match self.history.load(&fc.before) {
+                Some(text) => self.restore_text(&fc.path, text),
+                None => Err(String::new()),
+            };
+            match res {
+                Ok(true) => in_tabs += 1,
+                Ok(false) => on_disk += 1,
+                Err(_) => failed.push(file_name(&fc.path)),
+            }
+        }
+        let mut msg = format!("Change set reverted: {on_disk} files saved, {in_tabs} open files edited (unsaved; Ctrl+Z undoes)");
+        if !failed.is_empty() {
+            msg += &format!("; failed: {}", failed.join(", "));
+        }
+        self.set_status(ctx, msg);
+        if let Some(h) = self.hist.as_mut() {
+            h.shown = None;
         }
     }
 
@@ -1622,6 +1649,7 @@ impl App {
 
         let mut close = false;
         let mut revert = false;
+        let mut revert_set = false;
         let mut open_in_editor = false;
         {
             let Some(h) = self.hist.as_mut() else { return };
@@ -1631,12 +1659,17 @@ impl App {
                 ui.label(RichText::new(format!("Local History of {what} {}", h.target.display())).strong());
                 ui.separator();
                 ui.label("Compare with:");
-                ui.radio_value(&mut h.compare, HistCompare::Current, "Current")
-                    .on_hover_text("The selected version against the file as it is now");
                 ui.radio_value(&mut h.compare, HistCompare::Previous, "Previous version")
-                    .on_hover_text("What changed in the selected version");
+                    .on_hover_text("What the selected change set changed in the file");
+                ui.radio_value(&mut h.compare, HistCompare::Current, "Current")
+                    .on_hover_text("The file after the selected change set against the file as it is now");
                 ui.separator();
-                revert = ui.button("Revert to This Version").on_hover_text("Open files: undoable edit. Others: written to disk.").clicked();
+                revert = ui.button("Revert to This Version").on_hover_text("The selected file as it was after this change set.\nOpen files: undoable edit. Others: written to disk.").clicked();
+                let n = h.sets.get(h.sel.0).map_or(0, |s| s.files.len());
+                revert_set = ui
+                    .button("Revert Change Set")
+                    .on_hover_text(format!("Put the {n} file(s) of this change set back as they were before it.\nOpen files: undoable edit. Others: written to disk."))
+                    .clicked();
                 open_in_editor = ui.button("Open in Editor").on_hover_text("Editable diff of this version against the file").clicked();
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     close = ui.button("× Close").on_hover_text("Esc").clicked();
@@ -1650,8 +1683,12 @@ impl App {
         if revert {
             self.hist_revert(ctx);
         }
+        if revert_set {
+            self.hist_revert_set(ctx);
+        }
         if open_in_editor {
-            let Some((path, v)) = self.hist.as_ref().and_then(|h| h.entries.get(h.sel).cloned()) else { return };
+            let Some(fc) = self.hist.as_ref().and_then(hist_selected).cloned() else { return };
+            let (path, v) = (fc.path, fc.after);
             if let Some(text) = self.history.load(&v) {
                 if !path.exists() && !self.tabs.iter().any(|t| t.doc.path.as_ref() == Some(&path)) {
                     return self.set_status(ctx, "The file was deleted; use Revert to This Version to restore it");
@@ -1690,39 +1727,58 @@ impl App {
                 let mut exists: HashMap<PathBuf, bool> = HashMap::new();
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     let mut last_day = String::new();
-                    for i in hist_visible(h) {
-                        let (path, v) = &h.entries[i];
-                        let (time, day) = history::format_time(v.time);
-                        if day != last_day {
-                            ui.add_space(4.0);
-                            ui.label(RichText::new(day.to_uppercase()).small().weak());
-                            last_day = day;
-                        }
-                        let ago = match now.saturating_sub(v.time) / 1000 {
+                    let mut last_set = usize::MAX;
+                    for (si, fi) in hist_visible(h) {
+                        let set = &h.sets[si];
+                        let fc = &set.files[fi];
+                        let (end, day) = history::format_time(set.end);
+                        let (start, _) = history::format_time(set.start);
+                        // "14:32:05", or "14:30–14:34" for a set spanning minutes
+                        let when = if start[..5] == end[..5] { end.clone() } else { format!("{}–{}", &start[..5], &end[..5]) };
+                        let ago = match now.saturating_sub(set.end) / 1000 {
                             s if s < 60 => format!("{s} s ago"),
                             s if s < 3600 => format!("{} min ago", s / 60),
                             s if s < 86400 => format!("{} h ago", s / 3600),
                             s => format!("{} d ago", s / 86400),
                         };
-                        let event = history::Event::label(&v.event);
-                        let mut text = format!("{time}  {event}");
-                        if h.folder {
-                            let rel = path.strip_prefix(&h.target).unwrap_or(path).to_string_lossy().replace('\\', "/");
-                            text = format!("{time}  {rel}\n          {event} · {ago}");
+                        if day != last_day {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(day.to_uppercase()).small().weak());
+                            last_day = day;
                         }
-                        let deleted = !*exists.entry(path.clone()).or_insert_with(|| path.exists());
-                        let mut rt = RichText::new(text);
-                        if deleted {
-                            rt = rt.color(c.gutter_fg).strikethrough();
-                        }
-                        let r = ui.selectable_label(i == h.sel, rt);
-                        let r = if h.folder { r } else { r.on_hover_text(ago) };
+                        let deleted = !*exists.entry(fc.path.clone()).or_insert_with(|| fc.path.exists());
+                        let strike = |rt: RichText| if deleted { rt.color(c.gutter_fg).strikethrough() } else { rt };
+                        let r = if h.folder {
+                            if si != last_set {
+                                // the change set's header; clicking it picks its first file
+                                ui.add_space(2.0);
+                                let n = set.files.len();
+                                let files = if n == 1 { "1 file".to_string() } else { format!("{n} files") };
+                                let head = RichText::new(format!("{when}  {} · {files}", set.label())).strong();
+                                let hr = ui.add(egui::Label::new(head).sense(Sense::click())).on_hover_text(&ago);
+                                if hr.clicked() {
+                                    h.sel = (si, fi);
+                                    ui.memory_mut(|m| m.request_focus(list_id));
+                                }
+                            }
+                            let rel = fc.path.strip_prefix(&h.target).unwrap_or(&fc.path).to_string_lossy().replace('\\', "/");
+                            ui.horizontal(|ui| {
+                                ui.add_space(14.0);
+                                ui.selectable_label(h.sel == (si, fi), strike(RichText::new(rel)))
+                            })
+                            .inner
+                        } else {
+                            let saves = if fc.count > 1 { format!(" ×{}", fc.count) } else { String::new() };
+                            ui.selectable_label(h.sel == (si, fi), strike(RichText::new(format!("{when}  {}{saves}", set.label()))))
+                                .on_hover_text(&ago)
+                        };
+                        last_set = si;
                         let r = if deleted { r.on_hover_text("Deleted since; Revert to This Version restores it") } else { r };
                         if r.clicked() {
-                            h.sel = i;
+                            h.sel = (si, fi);
                             ui.memory_mut(|m| m.request_focus(list_id));
                         }
-                        if scroll_to && i == h.sel {
+                        if scroll_to && h.sel == (si, fi) {
                             r.scroll_to_me(None);
                         }
                     }
@@ -3148,17 +3204,23 @@ fn git_head_text(path: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Indices of the Local History entries matching the folder filter (file name/path).
-fn hist_visible(h: &HistView) -> Vec<usize> {
+/// (change set, file) rows of the Local History list matching the folder filter (file name/path).
+fn hist_visible(h: &HistView) -> Vec<(usize, usize)> {
     let f = h.filter.to_lowercase();
-    h.entries
-        .iter()
-        .enumerate()
-        .filter(|(_, (p, _))| {
-            f.is_empty() || p.strip_prefix(&h.target).unwrap_or(p).to_string_lossy().to_lowercase().contains(&f)
-        })
-        .map(|(i, _)| i)
-        .collect()
+    let mut rows = vec![];
+    for (si, set) in h.sets.iter().enumerate() {
+        for (fi, fc) in set.files.iter().enumerate() {
+            let p = &fc.path;
+            if f.is_empty() || p.strip_prefix(&h.target).unwrap_or(p).to_string_lossy().to_lowercase().contains(&f) {
+                rows.push((si, fi));
+            }
+        }
+    }
+    rows
+}
+
+fn hist_selected(h: &HistView) -> Option<&history::FileChange> {
+    h.sets.get(h.sel.0)?.files.get(h.sel.1)
 }
 
 /// Warning text colour (amber).
