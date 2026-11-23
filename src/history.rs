@@ -72,6 +72,7 @@ pub struct Version {
 
 enum Job {
     Record { path: PathBuf, text: Rope, event: Event, time: u64 },
+    Label { root: PathBuf, id: String, time: u64, text: String },
 }
 
 pub struct History {
@@ -112,7 +113,14 @@ impl History {
                 prune_daily(&root);
                 // last blob per file, so re-recording identical content is a no-op
                 let mut last: HashMap<PathBuf, String> = HashMap::new();
-                while let Ok(Job::Record { path, text, event, time }) = rx.recv() {
+                // root + id of the labels written, read when the first label comes
+                let mut labelled: Option<HashSet<String>> = None;
+                while let Ok(job) = rx.recv() {
+                    if let Job::Label { root: r, id, time, text } = job {
+                        let _ = write_label(&root, &mut labelled, &r, &id, time, &text);
+                        continue;
+                    }
+                    let Job::Record { path, text, event, time } = job else { continue };
                     let _ = write_version(&root, &mut last, &path, &text, event, time);
                 }
             })
@@ -137,6 +145,32 @@ impl History {
         self.record(path, &Rope::from_str(&t), event);
     }
 
+    /// Label the history of everything under `root` (e.g. a Git commit), once per `id`.
+    pub fn add_label(&self, root: &Path, id: &str, time: u64, text: &str) {
+        if let Some(tx) = &self.tx {
+            let text = text.replace(['\t', '\r', '\n'], " ");
+            let _ = tx.send(Job::Label { root: root.to_path_buf(), id: id.to_string(), time, text });
+        }
+    }
+
+    /// Labels that apply to `target` (a file or folder), newest first.
+    pub fn labels_for(&self, target: &Path) -> Vec<Label> {
+        let Some(dir) = &self.dir else { return vec![] };
+        let mut seen = HashSet::new();
+        let mut out: Vec<Label> = read_labels(&dir.join(LABELS))
+            .into_iter()
+            .filter(|(_, root, _)| target.starts_with(root) || root.starts_with(target))
+            .filter(|(id, _, _)| seen.insert(id.clone())) // nested sidebar folders of one repository
+            .map(|(_, _, l)| l)
+            .collect();
+        out.sort_by(|a, b| b.time.cmp(&a.time));
+        out
+    }
+
+    fn label_times(&self, target: &Path) -> Vec<u64> {
+        self.labels_for(target).iter().map(|l| l.time).collect()
+    }
+
     /// Versions of `path`, newest first.
     pub fn versions(&self, path: &Path) -> Vec<Version> {
         let Some(dir) = &self.dir else { return vec![] };
@@ -149,7 +183,7 @@ impl History {
     pub fn change_sets_of(&self, path: &Path) -> Vec<ChangeSet> {
         let mut v = self.versions(path);
         v.reverse();
-        change_sets(vec![(path.to_path_buf(), v)])
+        change_sets(vec![(path.to_path_buf(), v)], &self.label_times(path))
     }
 
     /// Change sets touching files under `dir` (including files deleted since), newest first.
@@ -165,7 +199,7 @@ impl History {
                 }
             }
         }
-        change_sets(logs)
+        change_sets(logs, &self.label_times(dir))
     }
 
     pub fn load(&self, v: &Version) -> Option<String> {
@@ -234,6 +268,46 @@ fn write_version(
     Ok(())
 }
 
+const LABELS: &str = "labels.log";
+
+/// A mark in the history, like a Git commit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Label {
+    pub time: u64,
+    pub text: String,
+}
+
+/// `labels.log`: one line per label, `<unix ms>\t<id>\t<root>\t<text>`.
+fn read_labels(file: &Path) -> Vec<(String, PathBuf, Label)> {
+    let Ok(text) = std::fs::read_to_string(file) else { return vec![] };
+    text.lines()
+        .filter_map(|l| {
+            let mut f = l.splitn(4, '\t');
+            let (time, id, root, text) = (f.next()?.parse().ok()?, f.next()?, f.next()?, f.next()?);
+            Some((id.to_string(), PathBuf::from(root), Label { time, text: text.to_string() }))
+        })
+        .collect()
+}
+
+fn write_label(
+    dir: &Path,
+    labelled: &mut Option<HashSet<String>>,
+    root: &Path,
+    id: &str,
+    time: u64,
+    text: &str,
+) -> std::io::Result<()> {
+    let file = dir.join(LABELS);
+    let key = |root: &Path, id: &str| format!("{}\t{id}", root.display());
+    let done = labelled.get_or_insert_with(|| read_labels(&file).iter().map(|(id, r, _)| key(r, id)).collect());
+    // once per commit and folder; nothing older than what pruning keeps
+    if !done.insert(key(root, id)) || time < now_ms().saturating_sub(KEEP_DAYS * 24 * 3600 * 1000) {
+        return Ok(());
+    }
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&file)?;
+    writeln!(f, "{time}\t{id}\t{}\t{text}", root.display())
+}
+
 /// Drop old versions and unused blobs, at most once a day.
 fn prune_daily(root: &Path) {
     let marker = root.join("last-prune");
@@ -245,6 +319,17 @@ fn prune_daily(root: &Path) {
     }
     let _ = std::fs::write(&marker, b"");
     let cutoff = now_ms().saturating_sub(KEEP_DAYS * 24 * 3600 * 1000);
+    let labels = read_labels(&root.join(LABELS));
+    if labels.iter().any(|(_, _, l)| l.time < cutoff) {
+        let mut s = String::new();
+        for (id, r, l) in labels.iter().filter(|(_, _, l)| l.time >= cutoff) {
+            s += &format!("{}\t{id}\t{}\t{}\n", l.time, r.display(), l.text);
+        }
+        let tmp = root.join("labels.tmp");
+        if std::fs::write(&tmp, s).is_ok() {
+            let _ = std::fs::rename(&tmp, root.join(LABELS));
+        }
+    }
     let mut used = HashSet::new();
     if let Ok(rd) = std::fs::read_dir(root.join("index")) {
         for e in rd.flatten() {
@@ -329,8 +414,9 @@ impl ChangeSet {
 }
 
 /// Group the version logs of files into change sets, newest first. A file's first version
-/// is its baseline (usually from opening it), not a change, so it starts no set.
-pub fn change_sets(logs: Vec<(PathBuf, Vec<Version>)>) -> Vec<ChangeSet> {
+/// is its baseline (usually from opening it), not a change, so it starts no set. Changes on
+/// both sides of a label (a commit) never share a set.
+pub fn change_sets(logs: Vec<(PathBuf, Vec<Version>)>, labels: &[u64]) -> Vec<ChangeSet> {
     // every version with a predecessor is a change: (time, path, before, after)
     let mut changes: Vec<(u64, PathBuf, Version, Version)> = vec![];
     for (path, mut versions) in logs {
@@ -345,6 +431,7 @@ pub fn change_sets(logs: Vec<(PathBuf, Vec<Version>)>) -> Vec<ChangeSet> {
         let replace = after.event == Event::Replaced.tag();
         let joins = sets.last().is_some_and(|s| {
             s.replace == replace
+                && !labels.iter().any(|&l| s.end < l && l <= time) // a commit ends a set
                 && time.saturating_sub(s.end) <= if replace { REPLACE_GAP_MS } else { SET_GAP_MS }
                 && (replace || time.saturating_sub(s.start) <= SET_SPAN_MS)
         });
@@ -476,10 +563,36 @@ mod tests {
     }
 
     #[test]
+    fn commit_labels_are_stored_once_and_split_sets() {
+        let root = std::env::temp_dir().join(format!("edit-history-labels-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let now = now_ms();
+        let mut done = None;
+        let repo = PathBuf::from("/repo");
+        write_label(&root, &mut done, &repo, "abc", now - 5000, "Commit: one").unwrap();
+        write_label(&root, &mut None, &repo, "abc", now - 5000, "Commit: one").unwrap(); // fresh writer: still once
+        write_label(&root, &mut done, &repo.join("sub"), "abc", now - 5000, "Commit: one").unwrap(); // nested folder
+        write_label(&root, &mut done, &repo, "old", 1, "Commit: ancient").unwrap(); // past retention: dropped
+        write_label(&root, &mut done, Path::new("/other"), "def", now, "Commit: other repo").unwrap();
+        let h = History { dir: Some(root.clone()), tx: None, worker: None };
+        let texts = |p: &str| h.labels_for(Path::new(p)).into_iter().map(|l| l.text).collect::<Vec<_>>();
+        assert_eq!(texts("/repo/sub/a.rs"), vec!["Commit: one"]);
+        assert_eq!(texts("/"), vec!["Commit: other repo", "Commit: one"]);
+        assert!(texts("/elsewhere").is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+
+        // saves a minute apart, with a commit between the 2nd and 3rd
+        let v = |t: u64| Version { time: t * 60_000, event: "saved".into(), blob: format!("{t}"), chars: 1 };
+        let sets = change_sets(vec![(PathBuf::from("/a"), (0..=4).map(v).collect())], &[2 * 60_000 + 30_000]);
+        assert_eq!(sets.iter().map(|s| s.files[0].count).collect::<Vec<_>>(), vec![2, 2]);
+    }
+
+    #[test]
     fn long_editing_sessions_are_split() {
         let v = |t: u64| Version { time: t * 60_000, event: "saved".into(), blob: format!("{t}"), chars: 1 };
         // a save every 2 minutes for 40 minutes: no gap, but sets span at most 15 minutes
-        let sets = change_sets(vec![(PathBuf::from("/a"), (0..=20).map(|i| v(i * 2)).collect())]);
+        let sets = change_sets(vec![(PathBuf::from("/a"), (0..=20).map(|i| v(i * 2)).collect())], &[]);
         assert_eq!(sets.len(), 3);
         assert!(sets.iter().all(|s| s.end - s.start <= SET_SPAN_MS));
         assert_eq!(sets[0].label(), "Saved");

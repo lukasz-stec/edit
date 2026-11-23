@@ -45,7 +45,8 @@ Pass files or a folder on the command line: `edit path/to/project path/to/file.r
 - **Local History** like IntelliJ: every file version you open, save, or that changes on disk
   is kept for 30 days (compressed, deduplicated, written in the background). Changes are
   grouped into change sets: one Replace in Files, or edits made within a few minutes; files
-  that were only opened don't show up. Compare a change with what came before or with the
+  that were only opened don't show up. Git commits appear as labels ("Commit: message")
+  between the change sets. Compare a change with what came before or with the
   current text, revert single changes, a file, or a whole change set.
 - **Git status in the sidebar** like IntelliJ: modified (blue), added (green), untracked (red),
   ignored (olive) and conflicted files; folders show their changes; the branch is in the

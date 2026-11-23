@@ -138,6 +138,8 @@ struct HistView {
     folder: bool,
     /// Change sets, newest first.
     sets: Vec<history::ChangeSet>,
+    /// Labels (Git commits), newest first, shown between the change sets.
+    labels: Vec<history::Label>,
     /// Selected (change set, file in it).
     sel: (usize, usize),
     compare: HistCompare,
@@ -1486,10 +1488,12 @@ impl App {
             return self.set_status(ctx, format!("No local changes recorded for {} yet", file_name(&target)));
         }
         self.palette = None;
+        let labels = self.history.labels_for(&target);
         self.hist = Some(HistView {
             target,
             folder,
             sets,
+            labels,
             sel: (0, 0),
             compare: HistCompare::Previous,
             filter: String::new(),
@@ -1728,6 +1732,8 @@ impl App {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     let mut last_day = String::new();
                     let mut last_set = usize::MAX;
+                    let mut next_label = 0;
+                    let label_bg = Color32::from_rgb(0x3e, 0x5c, 0x45);
                     for (si, fi) in hist_visible(h) {
                         let set = &h.sets[si];
                         let fc = &set.files[fi];
@@ -1741,6 +1747,19 @@ impl App {
                             s if s < 86400 => format!("{} h ago", s / 3600),
                             s => format!("{} d ago", s / 86400),
                         };
+                        // labels (Git commits) made after this set, above it
+                        while let Some(l) = h.labels.get(next_label).filter(|l| l.time > set.end) {
+                            let (ltime, lday) = history::format_time(l.time);
+                            if lday != last_day {
+                                ui.add_space(4.0);
+                                ui.label(RichText::new(lday.to_uppercase()).small().weak());
+                                last_day = lday;
+                            }
+                            ui.add_space(2.0);
+                            let text = RichText::new(format!(" {ltime}  {} ", l.text)).color(Color32::WHITE).background_color(label_bg);
+                            ui.add(egui::Label::new(text).truncate()).on_hover_text(&l.text);
+                            next_label += 1;
+                        }
                         if day != last_day {
                             ui.add_space(4.0);
                             ui.label(RichText::new(day.to_uppercase()).small().weak());
@@ -2540,6 +2559,12 @@ impl App {
             // commits, checkouts etc.: reload the HEAD versions behind the gutter markers
             self.heads.clear();
             self.heads_gen += 1;
+            // a new commit labels the Local History (stored once per commit)
+            for (root, st) in &self.git.roots {
+                if let Some(c) = &st.commit {
+                    self.history.add_label(root, &c.hash, c.time, &c.label);
+                }
+            }
         }
         if self.git_roots != self.roots {
             self.git_roots = self.roots.clone();

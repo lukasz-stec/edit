@@ -50,6 +50,8 @@ pub struct RootStatus {
     pub files: HashMap<PathBuf, Status>,
     /// Folders containing changed files, with their most important status.
     pub dirs: HashMap<PathBuf, Status>,
+    /// The latest move of HEAD, if it was a commit (for Local History labels).
+    pub commit: Option<Commit>,
 }
 
 impl RootStatus {
@@ -131,11 +133,35 @@ pub fn parse(out: &str, root: &Path, prefix: &str) -> RootStatus {
     st
 }
 
+/// A commit HEAD moved to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Commit {
+    pub hash: String,
+    /// Commit time, Unix ms.
+    pub time: u64,
+    /// "Commit: message", "Commit (amend): message", …
+    pub label: String,
+}
+
+/// Parse `git log -g -1 --format=%H%x09%ct%x09%gs`: the newest reflog entry of HEAD, kept
+/// only when it records a commit (not a checkout, reset, pull…).
+pub fn parse_reflog(out: &str) -> Option<Commit> {
+    let mut f = out.trim_end_matches(['\r', '\n']).splitn(3, '\t');
+    let (hash, time, subject) = (f.next()?, f.next()?.parse::<u64>().ok()?, f.next()?);
+    let rest = subject.strip_prefix("commit")?;
+    if !(rest.starts_with(':') || rest.starts_with(" (")) || hash.len() < 7 {
+        return None;
+    }
+    Some(Commit { hash: hash.to_string(), time: time * 1000, label: format!("Commit{rest}") })
+}
+
 /// Status of one sidebar folder, or None if it isn't in a Git repository (or git is missing).
 pub fn status(root: &Path) -> Option<RootStatus> {
     let prefix = run(git(root).args(["rev-parse", "--show-prefix"]))?;
     let out = run(git(root).args(["status", "--porcelain=v1", "-z", "--branch", "--ignored"]))?;
-    Some(parse(&out, root, prefix.trim()))
+    let mut st = parse(&out, root, prefix.trim());
+    st.commit = run(git(root).args(["log", "-g", "-1", "--format=%H%x09%ct%x09%gs"])).and_then(|s| parse_reflog(&s));
+    Some(st)
 }
 
 /// Background refreshes, one at a time.
@@ -245,6 +271,17 @@ mod tests {
     fn branch_variants() {
         assert_eq!(parse("## No commits yet on master\0", Path::new("/r"), "").branch, "master");
         assert_eq!(parse("## feature/x\0", Path::new("/r"), "").branch, "feature/x");
+    }
+
+    #[test]
+    fn commits_from_the_reflog() {
+        let c = parse_reflog("0123456789abcdef\t1700000000\tcommit: Fix the thing\n").unwrap();
+        assert_eq!((c.hash.as_str(), c.time, c.label.as_str()), ("0123456789abcdef", 1_700_000_000_000, "Commit: Fix the thing"));
+        assert_eq!(parse_reflog("0123456789abcdef\t1\tcommit (amend): x").unwrap().label, "Commit (amend): x");
+        assert_eq!(parse_reflog("0123456789abcdef\t1\tcommit (initial): x").unwrap().label, "Commit (initial): x");
+        assert_eq!(parse_reflog("0123456789abcdef\t1\tcheckout: moving from a to b"), None);
+        assert_eq!(parse_reflog("0123456789abcdef\t1\tcommitted: x"), None);
+        assert_eq!(parse_reflog(""), None);
     }
 
     #[test]
