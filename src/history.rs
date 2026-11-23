@@ -275,6 +275,8 @@ const LABELS: &str = "labels.log";
 pub struct Label {
     pub time: u64,
     pub text: String,
+    /// Put by the user (otherwise a Git commit).
+    pub user: bool,
 }
 
 /// `labels.log`: one line per label, `<unix ms>\t<id>\t<root>\t<text>`.
@@ -284,7 +286,7 @@ fn read_labels(file: &Path) -> Vec<(String, PathBuf, Label)> {
         .filter_map(|l| {
             let mut f = l.splitn(4, '\t');
             let (time, id, root, text) = (f.next()?.parse().ok()?, f.next()?, f.next()?, f.next()?);
-            Some((id.to_string(), PathBuf::from(root), Label { time, text: text.to_string() }))
+            Some((id.to_string(), PathBuf::from(root), Label { time, text: text.to_string(), user: id.starts_with("user-") }))
         })
         .collect()
 }
@@ -580,6 +582,9 @@ mod tests {
         assert_eq!(texts("/repo/sub/a.rs"), vec!["Commit: one"]);
         assert_eq!(texts("/"), vec!["Commit: other repo", "Commit: one"]);
         assert!(texts("/elsewhere").is_empty());
+        write_label(&root, &mut done, &repo, "user-7", now - 1000, "before refactoring").unwrap();
+        let l = h.labels_for(&repo);
+        assert_eq!((l[0].text.as_str(), l[0].user, l[1].user), ("before refactoring", true, false));
         let _ = std::fs::remove_dir_all(&root);
 
         // saves a minute apart, with a commit between the 2nd and 3rd

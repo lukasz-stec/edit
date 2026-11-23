@@ -36,6 +36,7 @@ enum PMode {
     Syntaxes,
     Clipboard,
     DiffTab,
+    Label,
 }
 
 #[derive(Clone)]
@@ -46,6 +47,7 @@ enum PAction {
     Theme(String),
     Syntax(String),
     Clip(usize),
+    Label(String),
     DiffTab(usize),
 }
 
@@ -138,7 +140,7 @@ struct HistView {
     folder: bool,
     /// Change sets, newest first.
     sets: Vec<history::ChangeSet>,
-    /// Labels (Git commits), newest first, shown between the change sets.
+    /// Labels (Git commits and the user's own), newest first, shown between the change sets.
     labels: Vec<history::Label>,
     /// Selected (change set, file in it).
     sel: (usize, usize),
@@ -870,6 +872,7 @@ impl App {
                 None => self.set_status(ctx, "Ctrl+click two files in the sidebar first"),
             },
             ShowHistory => self.show_history(ctx),
+            PutLabel => self.open_palette(PMode::Label, ""),
             ShowDiff => {
                 if let Some((a, b)) = self.tree_pair() {
                     self.run_tree_action(ctx, TreeAction::Compare(a, b));
@@ -1254,6 +1257,11 @@ impl App {
                     push(first, d, PAction::Clip(i), query);
                 }
             }
+            PMode::Label => {
+                let text = query.trim();
+                let label = if text.is_empty() { "Type a name for the label".to_string() } else { format!("Put label “{text}”") };
+                return vec![PItem { label, detail: self.label_scope(), hits: vec![], action: PAction::Label(text.to_string()) }];
+            }
             PMode::DiffTab => {
                 for (i, t) in self.tabs.iter().enumerate() {
                     if i != self.active {
@@ -1316,6 +1324,7 @@ impl App {
             PMode::Syntaxes => "Set syntax…",
             PMode::Clipboard => "Paste from history…",
             PMode::DiffTab => "Compare with tab…",
+            PMode::Label => "Local History label, e.g. before refactoring…",
         };
         let colors = self.colors.clone();
         egui::Area::new(Id::new("palette"))
@@ -1411,6 +1420,7 @@ impl App {
                 let t = self.cur();
                 t.view.cache = LineCache::new(name);
             }
+            PAction::Label(text) => self.put_label(ctx, &text),
             PAction::Clip(i) => {
                 if let Some(t) = self.clip_history.get(i).cloned() {
                     ctx.output_mut(|o| o.copied_text = t.clone());
@@ -1471,6 +1481,47 @@ impl App {
             }
             TreeAction::FolderHistory(dir) => self.open_history(ctx, dir, true),
         }
+    }
+
+    /// What a user label marks: every sidebar folder, else the current file; plus the
+    /// target of an open history window outside them.
+    fn label_targets(&self) -> Vec<PathBuf> {
+        let mut t = self.roots.clone();
+        if t.is_empty() {
+            t.extend(self.tabs[self.active].doc.path.clone());
+        }
+        if let Some(h) = &self.hist {
+            if !t.iter().any(|r| h.target.starts_with(r)) {
+                t.push(h.target.clone());
+            }
+        }
+        t
+    }
+
+    fn label_scope(&self) -> String {
+        match self.label_targets().as_slice() {
+            [] => "nothing to label: open a folder or a saved file".into(),
+            [one] => format!("in the history of {}", file_name(one)),
+            many => format!("in the history of {} folders", many.len()),
+        }
+    }
+
+    /// Put the user's own label into the Local History.
+    fn put_label(&mut self, ctx: &egui::Context, text: &str) {
+        let targets = self.label_targets();
+        if text.is_empty() || targets.is_empty() {
+            return;
+        }
+        let time = history::now_ms();
+        let id = format!("user-{time}");
+        for t in &targets {
+            self.history.add_label(t, &id, time, text);
+        }
+        // an open history window shows it at once (the file is written in the background)
+        if let Some(h) = self.hist.as_mut() {
+            h.labels.insert(0, history::Label { time, text: text.to_string(), user: true });
+        }
+        self.set_status(ctx, format!("Local History label “{text}” added"));
     }
 
     /// Local History of the current file (Alt+Shift+H).
@@ -1655,6 +1706,7 @@ impl App {
         let mut revert = false;
         let mut revert_set = false;
         let mut open_in_editor = false;
+        let mut put_label = false;
         {
             let Some(h) = self.hist.as_mut() else { return };
             ui.horizontal(|ui| {
@@ -1675,6 +1727,8 @@ impl App {
                     .on_hover_text(format!("Put the {n} file(s) of this change set back as they were before it.\nOpen files: undoable edit. Others: written to disk."))
                     .clicked();
                 open_in_editor = ui.button("Open in Editor").on_hover_text("Editable diff of this version against the file").clicked();
+                ui.separator();
+                put_label = ui.button("Put Label…").on_hover_text("Mark this moment in the Local History with your own label").clicked();
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     close = ui.button("× Close").on_hover_text("Esc").clicked();
                 });
@@ -1686,6 +1740,9 @@ impl App {
         }
         if revert {
             self.hist_revert(ctx);
+        }
+        if put_label {
+            self.open_palette(PMode::Label, "");
         }
         if revert_set {
             self.hist_revert_set(ctx);
@@ -1733,7 +1790,8 @@ impl App {
                     let mut last_day = String::new();
                     let mut last_set = usize::MAX;
                     let mut next_label = 0;
-                    let label_bg = Color32::from_rgb(0x3e, 0x5c, 0x45);
+                    let label_bg = Color32::from_rgb(0x3e, 0x5c, 0x45); // Git commits
+                    let user_bg = Color32::from_rgb(0x6b, 0x4f, 0x8a); // your own labels
                     for (si, fi) in hist_visible(h) {
                         let set = &h.sets[si];
                         let fc = &set.files[fi];
@@ -1756,7 +1814,7 @@ impl App {
                                 last_day = lday;
                             }
                             ui.add_space(2.0);
-                            let text = RichText::new(format!(" {ltime}  {} ", l.text)).color(Color32::WHITE).background_color(label_bg);
+                            let text = RichText::new(format!(" {ltime}  {} ", l.text)).color(Color32::WHITE).background_color(if l.user { user_bg } else { label_bg });
                             ui.add(egui::Label::new(text).truncate()).on_hover_text(&l.text);
                             next_label += 1;
                         }
@@ -2810,7 +2868,7 @@ impl eframe::App for App {
                     }
                 });
                 ui.menu_button("Diff", |ui| {
-                    for cmd in [Cmd::DiffWithSaved, Cmd::DiffWithHead, Cmd::DiffWithClipboard, Cmd::DiffWithFile, Cmd::DiffWithTab, Cmd::DiffTreeSelection, Cmd::ShowDiff, Cmd::ShowHistory, Cmd::NextDiff, Cmd::PrevDiff, Cmd::CloseDiff] {
+                    for cmd in [Cmd::DiffWithSaved, Cmd::DiffWithHead, Cmd::DiffWithClipboard, Cmd::DiffWithFile, Cmd::DiffWithTab, Cmd::DiffTreeSelection, Cmd::ShowDiff, Cmd::ShowHistory, Cmd::PutLabel, Cmd::NextDiff, Cmd::PrevDiff, Cmd::CloseDiff] {
                         item(ui, cmd, self);
                     }
                 });
