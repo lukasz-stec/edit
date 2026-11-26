@@ -19,7 +19,11 @@ use eframe::egui::{
     ViewportCommand,
 };
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Poll, Wake, Waker};
 
 pub struct Tab {
     pub doc: Document,
@@ -166,6 +170,52 @@ enum Pending {
     Quit,
 }
 
+/// An open native file dialog; its result arrives in a later frame. Dialogs never block:
+/// a blocking one runs a nested event loop inside winit's event handler, and on macOS
+/// winit aborts the app when that loop delivers an event winit had queued.
+struct FileDialog {
+    purpose: Picked,
+    result: Pin<Box<dyn Future<Output = Vec<rfd::FileHandle>>>>,
+}
+
+enum Picked {
+    Open,
+    OpenFolder,
+    AddFolder,
+    DiffWithFile,
+    /// A name for the document with this id; then the rest of the queue.
+    SaveAs(u64, SaveQueue),
+}
+
+/// Documents (by id) still to save, and what to do once they are.
+struct SaveQueue {
+    docs: Vec<u64>,
+    then: AfterSave,
+}
+
+enum AfterSave {
+    Nothing,
+    /// Close this document's tab.
+    Close(u64),
+    Quit,
+}
+
+impl SaveQueue {
+    /// A failed or cancelled save stops the queue, unless nothing waits for it.
+    fn goes_on(&self, saved: bool) -> bool {
+        saved || matches!(self.then, AfterSave::Nothing)
+    }
+}
+
+/// Repaints when a file dialog finishes.
+struct Repaint(egui::Context);
+
+impl Wake for Repaint {
+    fn wake(self: Arc<Self>) {
+        self.0.request_repaint();
+    }
+}
+
 enum Action {
     Cmd(Cmd),
     Text(String),
@@ -239,6 +289,8 @@ pub struct App {
     /// File and versions listed by the Local History palette.
     /// Local History window, shown instead of the editor while open.
     hist: Option<HistView>,
+    /// While a file dialog is open, commands and typing are ignored.
+    file_dialog: Option<FileDialog>,
 }
 
 impl App {
@@ -304,6 +356,7 @@ impl App {
             vcs_popup: None,
             history: History::start(),
             hist: None,
+            file_dialog: None,
         };
         let session = Session::load();
         let had_session = session.is_some();
@@ -552,10 +605,9 @@ impl App {
         self.files = walk_roots(&self.roots);
     }
 
+    /// Saves a tab that has a path; `save_queue` also handles untitled ones.
     fn save(&mut self, i: usize) -> bool {
-        let Some(p) = self.tabs[i].doc.path.clone() else {
-            return self.save_as(i);
-        };
+        let Some(p) = self.tabs[i].doc.path.clone() else { return false };
         match self.tabs[i].doc.save_to(&p) {
             Ok(()) => {
                 self.history.record(&p, &self.tabs[i].doc.rope, history::Event::Saved);
@@ -568,12 +620,93 @@ impl App {
         }
     }
 
-    fn save_as(&mut self, i: usize) -> bool {
-        let mut dlg = rfd::FileDialog::new().set_file_name(self.tabs[i].doc.name());
+    /// Saves the queued documents in order, asking where to save untitled ones.
+    fn save_queue(&mut self, ctx: &egui::Context, mut q: SaveQueue) {
+        while !q.docs.is_empty() {
+            let Some(i) = self.tab_of(q.docs.remove(0)) else { continue };
+            if self.tabs[i].doc.path.is_none() {
+                return self.ask_save_as(ctx, i, q);
+            }
+            let saved = self.save(i);
+            if !q.goes_on(saved) {
+                return;
+            }
+        }
+        match q.then {
+            AfterSave::Nothing => {}
+            AfterSave::Close(id) => {
+                if let Some(i) = self.tab_of(id) {
+                    self.force_close(i);
+                }
+            }
+            AfterSave::Quit => {
+                self.allow_quit = true;
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+        }
+    }
+
+    fn tab_of(&self, doc_id: u64) -> Option<usize> {
+        self.tabs.iter().position(|t| t.doc.id == doc_id)
+    }
+
+    /// Asks where to save tab `i`; the save and the rest of `q` follow when the dialog closes.
+    fn ask_save_as(&mut self, ctx: &egui::Context, i: usize, q: SaveQueue) {
+        let mut dlg = rfd::AsyncFileDialog::new().set_file_name(self.tabs[i].doc.name());
         if let Some(dir) = self.tabs[i].doc.path.as_ref().and_then(|p| p.parent()).or(self.roots.first().map(PathBuf::as_path)) {
             dlg = dlg.set_directory(dir);
         }
-        let Some(p) = dlg.save_file() else { return false };
+        let file = dlg.save_file();
+        self.start_dialog(ctx, Picked::SaveAs(self.tabs[i].doc.id, q), async move { file.await.into_iter().collect() });
+    }
+
+    fn start_dialog(&mut self, ctx: &egui::Context, purpose: Picked, result: impl Future<Output = Vec<rfd::FileHandle>> + 'static) {
+        self.file_dialog = Some(FileDialog { purpose, result: Box::pin(result) });
+        ctx.request_repaint(); // some backends only open the dialog when first polled
+    }
+
+    fn poll_file_dialog(&mut self, ctx: &egui::Context) {
+        let Some(d) = &mut self.file_dialog else { return };
+        let waker = Waker::from(Arc::new(Repaint(ctx.clone())));
+        let Poll::Ready(files) = d.result.as_mut().poll(&mut std::task::Context::from_waker(&waker)) else { return };
+        let purpose = self.file_dialog.take().unwrap().purpose;
+        let mut paths = files.iter().map(|f| f.path().to_path_buf());
+        match purpose {
+            Picked::Open => {
+                for p in paths {
+                    self.open_path(&p);
+                }
+            }
+            Picked::OpenFolder => {
+                if let Some(d) = paths.next() {
+                    self.set_root(d);
+                }
+            }
+            Picked::AddFolder => {
+                for d in paths {
+                    self.add_root(d);
+                }
+            }
+            Picked::DiffWithFile => {
+                if let Some(p) = paths.next() {
+                    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    self.open_diff(ctx, read_text(&p), format!("File: {name}"));
+                }
+            }
+            Picked::SaveAs(id, q) => {
+                let saved = match (self.tab_of(id), paths.next()) {
+                    (Some(i), Some(p)) => self.save_as(i, p),
+                    _ => false,
+                };
+                if q.goes_on(saved) {
+                    self.save_queue(ctx, q);
+                }
+            }
+        }
+        self.focus_editor(ctx);
+    }
+
+    fn save_as(&mut self, i: usize, p: PathBuf) -> bool {
         match self.tabs[i].doc.save_to(&p) {
             Ok(()) => {
                 self.history.record(&p, &self.tabs[i].doc.rope, history::Event::Saved);
@@ -690,6 +823,9 @@ impl App {
     }
 
     fn run(&mut self, ctx: &egui::Context, a: Action) {
+        if self.file_dialog.is_some() {
+            return;
+        }
         if self.left_focus && self.tabs[self.active].diff.is_some() {
             return self.run_left(ctx, a);
         }
@@ -778,36 +914,25 @@ impl App {
         match cmd {
             NewFile => self.new_tab(),
             OpenFile => {
-                if let Some(paths) = rfd::FileDialog::new().pick_files() {
-                    for p in paths {
-                        self.open_path(&p);
-                    }
-                }
+                let files = rfd::AsyncFileDialog::new().pick_files();
+                self.start_dialog(ctx, Picked::Open, async move { files.await.unwrap_or_default() });
             }
             OpenFolder => {
-                if let Some(d) = rfd::FileDialog::new().pick_folder() {
-                    self.set_root(d);
-                }
+                let dir = rfd::AsyncFileDialog::new().pick_folder();
+                self.start_dialog(ctx, Picked::OpenFolder, async move { dir.await.into_iter().collect() });
             }
             AddFolder => {
-                if let Some(dirs) = rfd::FileDialog::new().pick_folders() {
-                    for d in dirs {
-                        self.add_root(d);
-                    }
-                }
+                let dirs = rfd::AsyncFileDialog::new().pick_folders();
+                self.start_dialog(ctx, Picked::AddFolder, async move { dirs.await.unwrap_or_default() });
             }
             Save => {
-                self.save(self.active);
+                let docs = vec![self.tabs[self.active].doc.id];
+                self.save_queue(ctx, SaveQueue { docs, then: AfterSave::Nothing });
             }
-            SaveAs => {
-                self.save_as(self.active);
-            }
+            SaveAs => self.ask_save_as(ctx, self.active, SaveQueue { docs: vec![], then: AfterSave::Nothing }),
             SaveAll => {
-                for i in 0..self.tabs.len() {
-                    if self.tabs[i].doc.is_dirty() {
-                        self.save(i);
-                    }
-                }
+                let docs = self.tabs.iter().filter(|t| t.doc.is_dirty()).map(|t| t.doc.id).collect();
+                self.save_queue(ctx, SaveQueue { docs, then: AfterSave::Nothing });
             }
             CloseTab => self.close_tab(self.active),
             NextTab => self.active = (self.active + 1) % self.tabs.len(),
@@ -862,10 +987,14 @@ impl App {
                 let d = &mut self.tabs[self.active].doc;
                 d.use_tabs = !d.use_tabs;
             }
-            DiffWithSaved | DiffWithHead | DiffWithClipboard | DiffWithFile => {
+            DiffWithSaved | DiffWithHead | DiffWithClipboard => {
                 if let Some((text, title)) = self.diff_source(cmd) {
                     self.open_diff(ctx, text, title);
                 }
+            }
+            DiffWithFile => {
+                let file = rfd::AsyncFileDialog::new().pick_file();
+                self.start_dialog(ctx, Picked::DiffWithFile, async move { file.await.into_iter().collect() });
             }
             DiffTreeSelection => match self.tree_pair() {
                 Some((a, b)) => self.run_tree_action(ctx, TreeAction::Compare(a, b)),
@@ -1892,10 +2021,9 @@ impl App {
 
     fn diff_source(&mut self, cmd: Cmd) -> Option<(Result<String, String>, String)> {
         let doc = &self.tabs[self.active].doc;
-        let read = |p: &Path| std::fs::read(p).map(|b| String::from_utf8_lossy(&b).into_owned()).map_err(|e| e.to_string());
         Some(match cmd {
             Cmd::DiffWithSaved => match &doc.path {
-                Some(p) => (read(p).map_err(|e| format!("Cannot read saved file: {e}")), format!("Saved: {}", doc.name())),
+                Some(p) => (read_text(p).map_err(|e| format!("Cannot read saved file: {e}")), format!("Saved: {}", doc.name())),
                 None => (Err("This buffer has never been saved".into()), String::new()),
             },
             Cmd::DiffWithHead => match &doc.path {
@@ -1908,11 +2036,6 @@ impl App {
                     .map_err(|e| format!("Clipboard has no text: {e}")),
                 "Clipboard".into(),
             ),
-            Cmd::DiffWithFile => {
-                let p = rfd::FileDialog::new().pick_file()?;
-                let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                (read(&p), format!("File: {name}"))
-            }
             _ => return None,
         })
     }
@@ -2794,20 +2917,18 @@ impl App {
             });
         let Some(choice) = choice else { return };
         let pending = self.pending.take().unwrap();
+        let docs = dirty.iter().map(|&i| self.tabs[i].doc.id).collect();
         match (pending, choice) {
             (_, 2) => {}
             (Pending::CloseTab(i), 0) => {
-                if self.save(i) {
-                    self.force_close(i);
-                }
+                let id = self.tabs[i].doc.id;
+                self.save_queue(ctx, SaveQueue { docs, then: AfterSave::Close(id) });
             }
             (Pending::CloseTab(i), _) => self.force_close(i),
-            (Pending::Quit, c) => {
-                let ok = c == 1 || dirty.iter().all(|&i| self.save(i));
-                if ok {
-                    self.allow_quit = true;
-                    ctx.send_viewport_cmd(ViewportCommand::Close);
-                }
+            (Pending::Quit, 0) => self.save_queue(ctx, SaveQueue { docs, then: AfterSave::Quit }),
+            (Pending::Quit, _) => {
+                self.allow_quit = true;
+                ctx.send_viewport_cmd(ViewportCommand::Close);
             }
         }
         self.focus_editor(ctx);
@@ -2832,6 +2953,7 @@ impl eframe::App for App {
 
         self.sync_fs(ctx);
         self.vcs_update(ctx);
+        self.poll_file_dialog(ctx);
         self.handle_input(ctx);
         self.refresh_find();
         let c = self.colors.clone();
@@ -3269,6 +3391,10 @@ fn setup_fonts(ctx: &egui::Context) {
 }
 
 /// Contents of `path` at Git HEAD (`git show HEAD:./name`, run from the file's folder).
+fn read_text(p: &Path) -> Result<String, String> {
+    std::fs::read(p).map(|b| String::from_utf8_lossy(&b).into_owned()).map_err(|e| e.to_string())
+}
+
 fn git_head_text(path: &Path) -> Result<String, String> {
     let dir = path.parent().ok_or("File has no folder")?;
     let name = path.file_name().ok_or("Not a file")?.to_string_lossy().into_owned();
