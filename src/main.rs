@@ -11,6 +11,7 @@ mod highlight;
 mod history;
 mod icon;
 mod keymap;
+mod markdown;
 mod search;
 mod selection;
 mod session;

@@ -250,6 +250,8 @@ pub struct App {
     left_focus: bool,
     status: Option<(String, f64)>,
     camel_humps: bool,
+    /// Markdown editing (lists, fences, Ctrl+B/I) in Markdown files.
+    markdown: bool,
     to_open: Option<PathBuf>,
     /// Files selected in the sidebar tree (Ctrl+click adds), oldest first.
     tree_sel: Vec<PathBuf>,
@@ -329,6 +331,7 @@ impl App {
             left_focus: false,
             status: None,
             camel_humps: true,
+            markdown: false,
             to_open: None,
             tree_sel: vec![],
             tree_action: None,
@@ -385,6 +388,9 @@ impl App {
         }
         if let Some(m) = s.minimap {
             self.settings.minimap = m;
+        }
+        if let Some(m) = s.markdown {
+            self.markdown = m;
         }
         if let Some(c) = s.camel_humps {
             self.camel_humps = c;
@@ -462,6 +468,7 @@ impl App {
             sidebar: Some(self.sidebar),
             minimap: Some(self.settings.minimap),
             camel_humps: Some(self.camel_humps),
+            markdown: Some(self.markdown),
         }
     }
 
@@ -887,6 +894,8 @@ impl App {
                     JoinLines => doc.join_lines(),
                     SortLines => doc.sort_lines(),
                     ToggleCase => doc.toggle_case(),
+                    MdBold if doc.markdown => doc.toggle_emphasis("**"),
+                    MdItalic if doc.markdown => doc.toggle_emphasis("*"),
                     InsertLineBelow => doc.insert_line(false),
                     InsertLineAbove => doc.insert_line(true),
                     GotoBracket => doc.goto_matching_bracket(),
@@ -981,6 +990,15 @@ impl App {
                     t.doc.camel_humps = self.camel_humps;
                 }
                 let msg = format!("CamelHumps word movement {}", if self.camel_humps { "ON" } else { "OFF" });
+                self.set_status(ctx, msg);
+            }
+            ToggleMarkdown => {
+                self.markdown = !self.markdown;
+                let msg = if self.markdown {
+                    "Markdown editing ON: lists continue on Enter, Tab nests items, ``` adds a closing fence, Ctrl+B / Ctrl+I"
+                } else {
+                    "Markdown editing OFF"
+                };
                 self.set_status(ctx, msg);
             }
             ToggleIndentation => {
@@ -2952,6 +2970,9 @@ impl eframe::App for App {
         }
 
         self.sync_fs(ctx);
+        for t in &mut self.tabs {
+            t.doc.markdown = self.markdown && is_markdown(t);
+        }
         self.vcs_update(ctx);
         self.poll_file_dialog(ctx);
         self.handle_input(ctx);
@@ -2995,7 +3016,7 @@ impl eframe::App for App {
                     }
                 });
                 ui.menu_button("View", |ui| {
-                    for cmd in [Cmd::CommandPalette, Cmd::ToggleSidebar, Cmd::ToggleMinimap, Cmd::ZoomIn, Cmd::ZoomOut, Cmd::ZoomReset, Cmd::SelectTheme, Cmd::SetSyntax, Cmd::ToggleCamelHumps] {
+                    for cmd in [Cmd::CommandPalette, Cmd::ToggleSidebar, Cmd::ToggleMinimap, Cmd::ZoomIn, Cmd::ZoomOut, Cmd::ZoomReset, Cmd::SelectTheme, Cmd::SetSyntax, Cmd::ToggleCamelHumps, Cmd::ToggleMarkdown] {
                         item(ui, cmd, self);
                     }
                     if let Some(dir) = config_dir() {
@@ -3011,6 +3032,7 @@ impl eframe::App for App {
         });
 
         // ---------------- status bar
+        let mut toggle_md = false;
         egui::TopBottomPanel::bottom("status").frame(Frame::none().fill(c.panel).inner_margin(Margin::symmetric(8.0, 3.0))).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let t = &self.tabs[self.active];
@@ -3034,6 +3056,14 @@ impl eframe::App for App {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(RichText::new(&t.view.cache.syntax).small());
+                    if is_markdown(t) {
+                        ui.separator();
+                        let label = if self.markdown { "Markdown editing: on" } else { "Markdown editing: off" };
+                        toggle_md = ui
+                            .add(egui::Label::new(RichText::new(label).small()).sense(Sense::click()))
+                            .on_hover_text("Click to toggle: list continuation, code fences, Ctrl+B / Ctrl+I")
+                            .clicked();
+                    }
                     ui.separator();
                     ui.label(RichText::new(if d.crlf { "CRLF" } else { "LF" }).small());
                     ui.separator();
@@ -3049,6 +3079,9 @@ impl eframe::App for App {
                 });
             });
         });
+        if toggle_md {
+            self.run_global(ctx, Cmd::ToggleMarkdown);
+        }
         if self.status.as_ref().is_some_and(|(_, t)| *t > 0.0 && ctx.input(|i| i.time) - t > 4.0) {
             self.status = None;
         }
@@ -3430,6 +3463,15 @@ fn hist_visible(h: &HistView) -> Vec<(usize, usize)> {
 
 fn hist_selected(h: &HistView) -> Option<&history::FileChange> {
     h.sets.get(h.sel.0)?.files.get(h.sel.1)
+}
+
+/// A Markdown file (by syntax or extension)?
+fn is_markdown(t: &Tab) -> bool {
+    t.view.cache.syntax.contains("Markdown")
+        || t.doc.path.as_ref().and_then(|p| p.extension()).is_some_and(|e| {
+            let e = e.to_string_lossy().to_lowercase();
+            matches!(e.as_str(), "md" | "markdown" | "mdown" | "mkd")
+        })
 }
 
 /// Warning text colour (amber).

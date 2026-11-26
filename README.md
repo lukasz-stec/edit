@@ -55,6 +55,10 @@ Pass files or a folder on the command line: `edit path/to/project path/to/file.r
 - **Git change markers in the gutter**: added (green), modified (blue) and deleted lines
   against Git HEAD, live as you type; click a marker to see the original lines, roll them
   back, or open the full diff.
+- **Markdown editing** (View → Toggle Markdown Editing, or click it in the status bar of a
+  `.md` file): Enter continues lists (`-`, `1.` numbered on, `- [ ]` tasks) and `>` quotes,
+  Enter on an empty item ends the list, Tab nests an item, typing ```` ``` ```` adds the
+  closing fence, `*` `_` `~` wrap a selection, `Ctrl+B` / `Ctrl+I` toggle bold / italic.
 - **Follows the disk**: the sidebar updates when files are created, deleted or renamed,
   and open files reload when another program changes them (your unsaved edits are
   never overwritten; you get a warning instead).

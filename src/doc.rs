@@ -132,10 +132,37 @@ pub struct Document {
     expand_stack: Vec<(Vec<Sel>, Vec<Sel>)>,
     occ_whole_word: bool,
     pub camel_humps: bool,
+    /// Markdown editing: list continuation, fences, emphasis (set by the app).
+    pub markdown: bool,
     /// IntelliJ Column Selection Mode (per tab, not persisted).
     pub column_mode: bool,
     /// Active rectangular block; `sels` mirror it (clamped to line ends).
     pub block: Option<Block>,
+}
+
+/// Markdown Enter in a list item or quote: continue it, or end it when the item is empty.
+fn md_newline(rope: &Rope, pos: usize) -> Option<Edit> {
+    let (l, c) = pos_to_lc(rope, pos);
+    let line = line_text(rope, l);
+    let m = crate::markdown::marker(&line)?;
+    if c < m.len {
+        return None;
+    }
+    if line.chars().skip(m.len).all(char::is_whitespace) {
+        let ls = rope.line_to_char(l);
+        return Some(Edit::replace(ls, ls + line.chars().count(), ""));
+    }
+    Some(Edit::replace(pos, pos, format!("\n{}", m.next)))
+}
+
+/// Markdown: the third backtick of a fence at the start of a line adds the closing fence.
+fn md_fence(rope: &Rope, pos: usize) -> Option<Edit> {
+    let (l, c) = pos_to_lc(rope, pos);
+    let line = line_text(rope, l);
+    let before: String = line.chars().take(c).collect();
+    let indent: String = before.chars().take_while(|ch| *ch == ' ' || *ch == '\t').collect();
+    (before.trim_start() == "``" && line.chars().count() == c)
+        .then(|| Edit { start: pos, end: pos, text: format!("`\n{indent}```"), anchor: 1, head: 1 })
 }
 
 fn pair_close(c: char) -> Option<char> {
@@ -184,6 +211,7 @@ impl Document {
             expand_stack: vec![],
             occ_whole_word: false,
             camel_humps: true,
+            markdown: false,
             column_mode: false,
             block: None,
         }
@@ -675,6 +703,7 @@ impl Document {
             (Some(c), None) => Some(c),
             _ => None,
         };
+        let md = self.markdown;
         let rope = &self.rope;
         let len = rope.len_chars();
         let edits: Vec<Edit> = self
@@ -685,7 +714,14 @@ impl Document {
                 if let Some(c) = single {
                     let next = if en < len { Some(rope.char(en)) } else { None };
                     let prev = if st > 0 { Some(rope.char(st - 1)) } else { None };
-                    if let Some(close) = pair_close(c) {
+                    if md && s.is_empty() && c == '`' {
+                        if let Some(e) = md_fence(rope, st) {
+                            return e;
+                        }
+                    }
+                    // Markdown: * _ ~ wrap a selection like brackets do
+                    let wrap = (md && !s.is_empty() && matches!(c, '*' | '_' | '~')).then_some(c);
+                    if let Some(close) = pair_close(c).or(wrap) {
                         if !s.is_empty() {
                             // wrap selection
                             let inner = rope.slice(st..en).to_string();
@@ -715,6 +751,7 @@ impl Document {
 
     pub fn newline(&mut self) {
         let unit = self.indent_unit();
+        let md = self.markdown;
         let rope = &self.rope;
         let len = rope.len_chars();
         let edits: Vec<Edit> = self
@@ -722,6 +759,11 @@ impl Document {
             .iter()
             .map(|s| {
                 let (st, en) = (s.start(), s.end());
+                if md && st == en {
+                    if let Some(e) = md_newline(rope, st) {
+                        return e;
+                    }
+                }
                 let (l, c) = pos_to_lc(rope, st);
                 let indent: String =
                     rope.line(l).chars().take(c).take_while(|ch| *ch == ' ' || *ch == '\t').collect();
@@ -740,17 +782,60 @@ impl Document {
         self.apply(EditKind::Other, edits);
     }
 
+    /// Markdown bold/italic (`mark` = `**` / `*`): toggle it around each selection, or
+    /// insert an empty pair at a caret.
+    pub fn toggle_emphasis(&mut self, mark: &str) {
+        let rope = &self.rope;
+        let len = rope.len_chars();
+        let n = mark.chars().count();
+        let edits: Vec<Edit> = self
+            .sels
+            .iter()
+            .map(|s| {
+                let (st, en) = (s.start(), s.end());
+                let inner = rope.slice(st..en).to_string();
+                // already wrapped just outside the selection: unwrap
+                let mut outside = st >= n && en + n <= len && rope.slice(st - n..st) == mark && rope.slice(en..en + n) == mark;
+                if n == 1 && st >= 2 && rope.char(st - 2) == '*' {
+                    outside = false; // that '*' belongs to a bold "**"
+                }
+                if outside && !inner.is_empty() {
+                    let k = inner.chars().count();
+                    return Edit { start: st - n, end: en + n, text: inner, anchor: 0, head: k };
+                }
+                let out = crate::markdown::toggle_wrap(&inner, mark);
+                let k = out.chars().count();
+                if s.is_empty() {
+                    Edit { start: st, end: en, text: out, anchor: n, head: n }
+                } else if k < inner.chars().count() {
+                    Edit { start: st, end: en, text: out, anchor: 0, head: k }
+                } else {
+                    Edit { start: st, end: en, text: out, anchor: n, head: k - n }
+                }
+            })
+            .collect();
+        self.apply(EditKind::Other, edits);
+    }
+
     pub fn tab(&mut self) {
         if self.sels.iter().any(|s| !s.is_empty()) {
             return self.indent();
         }
         let (tab, use_tabs) = (self.tab_size, self.use_tabs);
+        let unit = self.indent_unit();
+        let md = self.markdown;
         let rope = &self.rope;
         let edits: Vec<Edit> = self
             .sels
             .iter()
             .map(|s| {
                 let (l, c) = pos_to_lc(rope, s.head);
+                if md && crate::markdown::marker(&line_text(rope, l)).is_some_and(|m| m.len > m.indent.chars().count()) {
+                    // Markdown list item: Tab nests the whole item
+                    let ls = rope.line_to_char(l);
+                    let k = c + unit.chars().count();
+                    return Edit { start: ls, end: ls, text: unit.clone(), anchor: k, head: k };
+                }
                 let v = visual_col(rope, l, c, tab);
                 let t = if use_tabs { "\t".to_string() } else { " ".repeat(tab - v % tab) };
                 Edit::replace(s.start(), s.end(), t)
@@ -762,7 +847,7 @@ impl Document {
     pub fn backspace(&mut self, word: bool) {
         let rope = &self.rope;
         let len = rope.len_chars();
-        let (tab, use_tabs, camel) = (self.tab_size, self.use_tabs, self.camel_humps);
+        let (tab, use_tabs, camel, md) = (self.tab_size, self.use_tabs, self.camel_humps, self.markdown);
         let edits: Vec<Edit> = self
             .sels
             .iter()
@@ -776,6 +861,18 @@ impl Document {
                 }
                 if word {
                     return Edit::replace(prev_word(rope, p, camel), p, "");
+                }
+                if md {
+                    // right after the marker of an empty item: remove the marker
+                    let (l, c) = pos_to_lc(rope, p);
+                    let line = line_text(rope, l);
+                    if let Some(m) = crate::markdown::marker(&line) {
+                        let ind = m.indent.chars().count();
+                        if c == m.len && m.len > ind && line.chars().skip(c).all(char::is_whitespace) {
+                            let ls = rope.line_to_char(l);
+                            return Edit::replace(ls + ind, p, "");
+                        }
+                    }
                 }
                 let prev = rope.char(p - 1);
                 let next = if p < len { Some(rope.char(p)) } else { None };
@@ -1543,6 +1640,69 @@ mod tests {
     }
     fn ranges(d: &Document) -> Vec<(usize, usize)> {
         d.sels.iter().map(|s| (s.anchor, s.head)).collect()
+    }
+
+    fn md(text: &str, at: usize) -> Document {
+        let mut d = doc(text, &[(at, at)]);
+        d.markdown = true;
+        d
+    }
+
+    #[test]
+    fn markdown_lists_continue_and_end() {
+        let mut d = md("- one", 5);
+        d.newline();
+        assert_eq!(d.rope.to_string(), "- one\n- ");
+        assert_eq!(ranges(&d), vec![(8, 8)]);
+        d.newline(); // empty item: ends the list
+        assert_eq!(d.rope.to_string(), "- one\n");
+        assert_eq!(ranges(&d), vec![(6, 6)]);
+
+        let mut d = md("1. a\n2. b", 9);
+        d.newline();
+        assert_eq!(d.rope.to_string(), "1. a\n2. b\n3. ");
+        let mut d = md("- [x] done", 10);
+        d.newline();
+        assert_eq!(d.rope.to_string(), "- [x] done\n- [ ] ");
+        let mut d = md("> quote", 7);
+        d.newline();
+        assert_eq!(d.rope.to_string(), "> quote\n> ");
+        // caret before the marker: a plain newline
+        let mut d = md("- one", 0);
+        d.newline();
+        assert_eq!(d.rope.to_string(), "\n- one");
+        // off: no continuation
+        let mut d = doc("- one", &[(5, 5)]);
+        d.newline();
+        assert_eq!(d.rope.to_string(), "- one\n");
+    }
+
+    #[test]
+    fn markdown_tab_backspace_fence_and_emphasis() {
+        let mut d = md("- one\n- two", 11);
+        d.tab(); // nests the item, caret keeps its place in the text
+        assert_eq!(d.rope.to_string(), "- one\n    - two");
+        assert_eq!(ranges(&d), vec![(15, 15)]);
+        let mut d = md("text\n  - ", 9);
+        d.backspace(false); // empty item: removes the marker, keeps the indent
+        assert_eq!(d.rope.to_string(), "text\n  ");
+        let mut d = md("``", 2);
+        d.type_text("`");
+        assert_eq!(d.rope.to_string(), "```\n```");
+        assert_eq!(ranges(&d), vec![(3, 3)]);
+        let mut d = doc("make it bold", &[(5, 7)]);
+        d.markdown = true;
+        d.toggle_emphasis("**");
+        assert_eq!(d.rope.to_string(), "make **it** bold");
+        assert_eq!(ranges(&d), vec![(7, 9)]);
+        d.toggle_emphasis("**"); // again: off
+        assert_eq!(d.rope.to_string(), "make it bold");
+        d.type_text("_"); // * _ ~ wrap a selection
+        assert_eq!(d.rope.to_string(), "make _it_ bold");
+        let mut d = md("ab", 1);
+        d.toggle_emphasis("*");
+        assert_eq!(d.rope.to_string(), "a**b");
+        assert_eq!(ranges(&d), vec![(2, 2)]);
     }
 
     #[test]

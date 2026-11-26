@@ -32,6 +32,7 @@ pub struct Session {
     pub sidebar: Option<bool>,
     pub minimap: Option<bool>,
     pub camel_humps: Option<bool>,
+    pub markdown: Option<bool>,
 }
 
 fn file_path() -> Option<PathBuf> {
@@ -82,6 +83,9 @@ impl Session {
         if let Some(b) = self.minimap {
             s += &format!("minimap\t{}\n", flag(b));
         }
+        if let Some(b) = self.markdown {
+            s += &format!("markdown\t{}\n", flag(b));
+        }
         if let Some(b) = self.camel_humps {
             s += &format!("camel\t{}\n", flag(b));
         }
@@ -111,6 +115,7 @@ impl Session {
                 "sidebar" => s.sidebar = Some(val == "1"),
                 "minimap" => s.minimap = Some(val == "1"),
                 "camel" => s.camel_humps = Some(val == "1"),
+                "markdown" => s.markdown = Some(val == "1"),
                 "active" => s.active = val.parse().unwrap_or(0),
                 "file" => {
                     let f: Vec<&str> = val.splitn(4, '\t').collect();
@@ -221,6 +226,7 @@ mod tests {
             sidebar: Some(true),
             minimap: Some(false),
             camel_humps: Some(true),
+            markdown: Some(true),
         };
         assert_eq!(Session::parse(&s.to_text()), s);
     }

@@ -75,6 +75,9 @@ pub enum Cmd {
     JoinLines,
     SortLines,
     ToggleCase,
+    MdBold,
+    MdItalic,
+    ToggleMarkdown,
     InsertLineBelow,
     InsertLineAbove,
     GotoBracket,
@@ -94,7 +97,7 @@ impl Cmd {
             NewFile | OpenFile | OpenFolder | AddFolder | Save | SaveAs | SaveAll | CloseTab | NextTab | PrevTab
                 | CommandPalette | GotoAnything | GotoLine | Find | FindInFiles | ReplaceInFiles | Replace | FindNext | FindPrev
                 | ToggleSidebar | ToggleMinimap | SelectTheme | SetSyntax | PasteFromHistory | ZoomIn
-                | ZoomOut | ZoomReset | ToggleCamelHumps | ToggleIndentation | ToggleLineEndings | ToggleColumnMode | Quit
+                | ZoomOut | ZoomReset | ToggleCamelHumps | ToggleMarkdown | ToggleIndentation | ToggleLineEndings | ToggleColumnMode | Quit
                 | DiffWithSaved | DiffWithHead | DiffWithClipboard | DiffWithFile | DiffWithTab | DiffTreeSelection | ShowDiff | ShowHistory | PutLabel | CloseDiff
                 | NextDiff | PrevDiff
         )
@@ -171,6 +174,9 @@ impl Cmd {
             JoinLines => "Edit: Join Lines",
             SortLines => "Edit: Sort Lines",
             ToggleCase => "Edit: Toggle Case",
+            MdBold => "Markdown: Bold",
+            MdItalic => "Markdown: Italic",
+            ToggleMarkdown => "Preferences: Toggle Markdown Editing",
             InsertLineBelow => "Edit: Insert Line After",
             InsertLineAbove => "Edit: Insert Line Before",
             GotoBracket => "Goto Matching Bracket",
@@ -188,7 +194,7 @@ impl Cmd {
             Undo, Redo, SelectAll, SelectLine, ExpandSelection, ShrinkSelection,
             SelectNextOccurrence, UnselectOccurrence, SelectAllOccurrences, SplitIntoLines,
             AddCaretAbove, AddCaretBelow, CaretsAtLineEnds, ToggleColumnMode, Duplicate, DeleteLine, MoveLineUp, MoveLineDown,
-            ToggleComment, Indent, Outdent, JoinLines, SortLines, ToggleCase, InsertLineBelow,
+            ToggleComment, Indent, Outdent, JoinLines, SortLines, ToggleCase, MdBold, MdItalic, ToggleMarkdown, InsertLineBelow,
             InsertLineAbove, GotoBracket, NextTab, PrevTab, Quit,
             DiffWithSaved, DiffWithHead, DiffWithClipboard, DiffWithFile, DiffWithTab, DiffTreeSelection, ShowDiff, ShowHistory, PutLabel, CloseDiff,
             NextDiff, PrevDiff,
@@ -270,6 +276,8 @@ const BINDINGS: &[B] = &[
     B(Cmd::JoinLines, C | S, Key::J),           // IntelliJ
     B(Cmd::SortLines, 0, Key::F9),
     B(Cmd::ToggleCase, C | S, Key::U),          // IntelliJ
+    B(Cmd::MdBold, C, Key::B),                  // Markdown files with Markdown editing on
+    B(Cmd::MdItalic, C, Key::I),
     B(Cmd::InsertLineBelow, C, Key::Enter),
     B(Cmd::InsertLineBelow, S, Key::Enter),     // IntelliJ "Start New Line"
     B(Cmd::InsertLineAbove, C | S, Key::Enter),
