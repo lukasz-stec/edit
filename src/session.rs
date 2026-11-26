@@ -33,6 +33,7 @@ pub struct Session {
     pub minimap: Option<bool>,
     pub camel_humps: Option<bool>,
     pub markdown: Option<bool>,
+    pub md_preview: Option<bool>,
 }
 
 fn file_path() -> Option<PathBuf> {
@@ -83,6 +84,9 @@ impl Session {
         if let Some(b) = self.minimap {
             s += &format!("minimap\t{}\n", flag(b));
         }
+        if let Some(b) = self.md_preview {
+            s += &format!("preview\t{}\n", flag(b));
+        }
         if let Some(b) = self.markdown {
             s += &format!("markdown\t{}\n", flag(b));
         }
@@ -116,6 +120,7 @@ impl Session {
                 "minimap" => s.minimap = Some(val == "1"),
                 "camel" => s.camel_humps = Some(val == "1"),
                 "markdown" => s.markdown = Some(val == "1"),
+                "preview" => s.md_preview = Some(val == "1"),
                 "active" => s.active = val.parse().unwrap_or(0),
                 "file" => {
                     let f: Vec<&str> = val.splitn(4, '\t').collect();
@@ -227,6 +232,7 @@ mod tests {
             minimap: Some(false),
             camel_humps: Some(true),
             markdown: Some(true),
+            md_preview: Some(false),
         };
         assert_eq!(Session::parse(&s.to_text()), s);
     }

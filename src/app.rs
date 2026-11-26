@@ -41,6 +41,7 @@ enum PMode {
     Clipboard,
     DiffTab,
     Label,
+    Headings,
 }
 
 #[derive(Clone)]
@@ -136,6 +137,20 @@ struct VcsPopup {
     at: egui::Pos2,
     /// The mouse button that opened it has been released (until then, ignore "click elsewhere").
     armed: bool,
+}
+
+/// The Markdown preview: rendered text of one document version, kept in step with the
+/// editor's scroll position.
+#[derive(Default)]
+struct Preview {
+    cache: egui_commonmark::CommonMarkCache,
+    doc: u64,
+    version: u64,
+    text: String,
+    /// Editor scroll offset last followed; preview content and viewport heights.
+    editor_scroll: f32,
+    content_h: f32,
+    view_h: f32,
 }
 
 struct HistView {
@@ -252,6 +267,11 @@ pub struct App {
     camel_humps: bool,
     /// Markdown editing (lists, fences, Ctrl+B/I) in Markdown files.
     markdown: bool,
+    /// Markdown preview pane beside Markdown files.
+    md_preview: bool,
+    preview: Preview,
+    /// Headings of the active Markdown file: (doc id, version, headings).
+    outline: (u64, u64, Vec<crate::markdown::Heading>),
     to_open: Option<PathBuf>,
     /// Files selected in the sidebar tree (Ctrl+click adds), oldest first.
     tree_sel: Vec<PathBuf>,
@@ -299,6 +319,7 @@ impl App {
     pub fn new(cc: &eframe::CreationContext, args: Vec<PathBuf>) -> Self {
         setup_fonts(&cc.egui_ctx);
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        egui_extras::install_image_loaders(&cc.egui_ctx); // images in the Markdown preview
         let syn = Syntax::load();
         let theme_name = ["base16-ocean.dark", "base16-eighties.dark"]
             .into_iter()
@@ -332,6 +353,9 @@ impl App {
             status: None,
             camel_humps: true,
             markdown: false,
+            md_preview: false,
+            preview: Preview::default(),
+            outline: (0, u64::MAX, vec![]),
             to_open: None,
             tree_sel: vec![],
             tree_action: None,
@@ -388,6 +412,9 @@ impl App {
         }
         if let Some(m) = s.minimap {
             self.settings.minimap = m;
+        }
+        if let Some(m) = s.md_preview {
+            self.md_preview = m;
         }
         if let Some(m) = s.markdown {
             self.markdown = m;
@@ -469,6 +496,7 @@ impl App {
             minimap: Some(self.settings.minimap),
             camel_humps: Some(self.camel_humps),
             markdown: Some(self.markdown),
+            md_preview: Some(self.md_preview),
         }
     }
 
@@ -992,6 +1020,13 @@ impl App {
                 let msg = format!("CamelHumps word movement {}", if self.camel_humps { "ON" } else { "OFF" });
                 self.set_status(ctx, msg);
             }
+            MarkdownPreview => {
+                self.md_preview = !self.md_preview;
+                if self.md_preview && !is_markdown(&self.tabs[self.active]) {
+                    self.set_status(ctx, "The preview shows beside Markdown files");
+                }
+            }
+            GotoHeading => self.open_palette(PMode::Headings, ""),
             ToggleMarkdown => {
                 self.markdown = !self.markdown;
                 let msg = if self.markdown {
@@ -1404,6 +1439,14 @@ impl App {
                     push(first, d, PAction::Clip(i), query);
                 }
             }
+            PMode::Headings => {
+                let d = &self.tabs[self.active].doc;
+                for h in crate::markdown::headings(d.rope.lines().map(|l| l.to_string())) {
+                    let title = if h.title.is_empty() { "(empty heading)".to_string() } else { h.title.clone() };
+                    let label = format!("{}{title}", "    ".repeat(h.level - 1));
+                    push(label, format!("H{} · line {}", h.level, h.line + 1), PAction::Line(h.line + 1), query);
+                }
+            }
             PMode::Label => {
                 let text = query.trim();
                 let label = if text.is_empty() { "Type a name for the label".to_string() } else { format!("Put label “{text}”") };
@@ -1471,6 +1514,7 @@ impl App {
             PMode::Syntaxes => "Set syntax…",
             PMode::Clipboard => "Paste from history…",
             PMode::DiffTab => "Compare with tab…",
+            PMode::Headings => "Go to heading…",
             PMode::Label => "Local History label, e.g. before refactoring…",
         };
         let colors = self.colors.clone();
@@ -2973,6 +3017,11 @@ impl eframe::App for App {
         for t in &mut self.tabs {
             t.doc.markdown = self.markdown && is_markdown(t);
         }
+        // outline of the active Markdown file, re-parsed when it changes
+        let t = &self.tabs[self.active];
+        if is_markdown(t) && (self.outline.0, self.outline.1) != (t.doc.id, t.doc.version) {
+            self.outline = (t.doc.id, t.doc.version, crate::markdown::headings(t.doc.rope.lines().map(|l| l.to_string())));
+        }
         self.vcs_update(ctx);
         self.poll_file_dialog(ctx);
         self.handle_input(ctx);
@@ -3016,7 +3065,7 @@ impl eframe::App for App {
                     }
                 });
                 ui.menu_button("View", |ui| {
-                    for cmd in [Cmd::CommandPalette, Cmd::ToggleSidebar, Cmd::ToggleMinimap, Cmd::ZoomIn, Cmd::ZoomOut, Cmd::ZoomReset, Cmd::SelectTheme, Cmd::SetSyntax, Cmd::ToggleCamelHumps, Cmd::ToggleMarkdown] {
+                    for cmd in [Cmd::CommandPalette, Cmd::ToggleSidebar, Cmd::ToggleMinimap, Cmd::ZoomIn, Cmd::ZoomOut, Cmd::ZoomReset, Cmd::SelectTheme, Cmd::SetSyntax, Cmd::ToggleCamelHumps, Cmd::ToggleMarkdown, Cmd::MarkdownPreview, Cmd::GotoHeading] {
                         item(ui, cmd, self);
                     }
                     if let Some(dir) = config_dir() {
@@ -3033,6 +3082,7 @@ impl eframe::App for App {
 
         // ---------------- status bar
         let mut toggle_md = false;
+        let mut toggle_preview = false;
         egui::TopBottomPanel::bottom("status").frame(Frame::none().fill(c.panel).inner_margin(Margin::symmetric(8.0, 3.0))).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let t = &self.tabs[self.active];
@@ -3063,6 +3113,12 @@ impl eframe::App for App {
                             .add(egui::Label::new(RichText::new(label).small()).sense(Sense::click()))
                             .on_hover_text("Click to toggle: list continuation, code fences, Ctrl+B / Ctrl+I")
                             .clicked();
+                        ui.separator();
+                        let label = if self.md_preview { "Preview: on" } else { "Preview: off" };
+                        toggle_preview = ui
+                            .add(egui::Label::new(RichText::new(label).small()).sense(Sense::click()))
+                            .on_hover_text("Click to toggle the Markdown preview (Alt+Shift+M)")
+                            .clicked();
                     }
                     ui.separator();
                     ui.label(RichText::new(if d.crlf { "CRLF" } else { "LF" }).small());
@@ -3079,6 +3135,9 @@ impl eframe::App for App {
                 });
             });
         });
+        if toggle_preview {
+            self.run_global(ctx, Cmd::MarkdownPreview);
+        }
         if toggle_md {
             self.run_global(ctx, Cmd::ToggleMarkdown);
         }
@@ -3105,6 +3164,39 @@ impl eframe::App for App {
                     if let Some(i) = activate {
                         self.active = i;
                         self.focus_editor(ctx);
+                    }
+                    // outline of the active Markdown file
+                    let t = &self.tabs[self.active];
+                    if is_markdown(t) && self.outline.0 == t.doc.id && !self.outline.2.is_empty() {
+                        ui.add_space(8.0);
+                        let caret_line = t.doc.rope.char_to_line(t.doc.primary_sel().head.min(t.doc.rope.len_chars()));
+                        let current = self.outline.2.iter().rposition(|h| h.line <= caret_line);
+                        let mut goto = None;
+                        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id("outline"), true)
+                            .show_header(ui, |ui| {
+                                ui.label(RichText::new("OUTLINE").small().weak()).on_hover_text("Headings of this file (Ctrl+F12 to search them)");
+                            })
+                            .body(|ui| {
+                                for (k, h) in self.outline.2.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space((h.level - 1) as f32 * 10.0);
+                                        let title = if h.title.is_empty() { "(empty heading)" } else { h.title.as_str() };
+                                        let mut text = RichText::new(title);
+                                        if h.level == 1 {
+                                            text = text.strong();
+                                        }
+                                        if ui.selectable_label(current == Some(k), text).on_hover_text(format!("Line {}", h.line + 1)).clicked() {
+                                            goto = Some(h.line);
+                                        }
+                                    });
+                                }
+                            });
+                        if let Some(l) = goto {
+                            let t = self.cur();
+                            t.doc.goto_line(l + 1);
+                            t.view.center_caret = true;
+                            self.focus_editor(ctx);
+                        }
                     }
                     ui.add_space(8.0);
                     if !self.roots.is_empty() {
@@ -3250,6 +3342,9 @@ impl eframe::App for App {
                     ui.memory_mut(|m| m.request_focus(self.editor_id));
                 }
             } else {
+                if self.md_preview && is_markdown(tab) {
+                    markdown_preview(ui, &mut self.preview, tab, &c);
+                }
                 let vcs: &[crate::diff::Hunk] = self.vcs_marks.get(&tab.doc.id).map_or(&[], |m| &m.1);
                 let cx = editor::Ctx {
                     syn: &self.syn,
@@ -3463,6 +3558,42 @@ fn hist_visible(h: &HistView) -> Vec<(usize, usize)> {
 
 fn hist_selected(h: &HistView) -> Option<&history::FileChange> {
     h.sets.get(h.sel.0)?.files.get(h.sel.1)
+}
+
+/// The Markdown preview, a resizable pane right of the editor. Its scroll position follows
+/// the editor's (proportionally) whenever the editor scrolls; scrolling it by hand is kept.
+fn markdown_preview(ui: &mut egui::Ui, p: &mut Preview, tab: &Tab, c: &Colors) {
+    let d = &tab.doc;
+    let switched = p.doc != d.id;
+    if switched || p.version != d.version {
+        p.text = d.rope.to_string();
+        (p.doc, p.version) = (d.id, d.version);
+    }
+    let v = &tab.view;
+    let width = ui.available_width() * 0.5;
+    egui::SidePanel::right("md_preview")
+        .resizable(true)
+        .default_width(width)
+        .frame(Frame::none().fill(c.panel).inner_margin(Margin::symmetric(16.0, 10.0)))
+        .show_inside(ui, |ui| {
+            let mut area = egui::ScrollArea::vertical().id_salt("md_preview").auto_shrink([false, false]);
+            if switched || (v.scroll.y - p.editor_scroll).abs() > 0.5 {
+                let editor_max = (d.rope.len_lines() as f32 * v.line_height - v.text_rect.height()).max(1.0);
+                let frac = (v.scroll.y / editor_max).clamp(0.0, 1.0);
+                area = area.vertical_scroll_offset(frac * (p.content_h - p.view_h).max(0.0));
+                p.editor_scroll = v.scroll.y;
+            }
+            // relative image paths are relative to the file
+            let base = d.path.as_ref().and_then(|f| f.parent()).map(|dir| format!("file://{}/", dir.display()));
+            let out = area.show(ui, |ui| {
+                let mut viewer = egui_commonmark::CommonMarkViewer::new();
+                if let Some(b) = base {
+                    viewer = viewer.default_implicit_uri_scheme(b);
+                }
+                viewer.show(ui, &mut p.cache, &p.text);
+            });
+            (p.content_h, p.view_h) = (out.content_size.y, out.inner_rect.height());
+        });
 }
 
 /// A Markdown file (by syntax or extension)?

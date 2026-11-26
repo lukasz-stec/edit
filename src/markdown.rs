@@ -78,6 +78,77 @@ pub fn marker(line: &str) -> Option<Marker> {
     Some(Marker { indent: indent.clone(), len, next: format!("{indent}{next}") })
 }
 
+/// A heading, for the outline.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Heading {
+    /// 0-based line.
+    pub line: usize,
+    /// 1–6.
+    pub level: usize,
+    pub title: String,
+}
+
+/// Headings: `# ATX` ones and `Setext` ones (a line underlined with `===` / `---`), not
+/// inside fenced code blocks.
+pub fn headings<S: AsRef<str>>(lines: impl IntoIterator<Item = S>) -> Vec<Heading> {
+    let mut out = vec![];
+    let mut fence: Option<(char, usize)> = None;
+    let mut prev: Option<(usize, String)> = None; // previous line, if it could be a Setext title
+    for (i, line) in lines.into_iter().enumerate() {
+        let line = line.as_ref().trim_end_matches(['\n', '\r']);
+        let indent = line.chars().take_while(|c| *c == ' ').count();
+        let t = line.trim();
+        // fenced code: ``` or ~~~ (3+), closed by the same char, at least as long
+        let fc = t.chars().next().filter(|c| *c == '`' || *c == '~');
+        if let Some(c) = fc.filter(|_| indent < 4) {
+            let n = t.chars().take_while(|x| *x == c).count();
+            if n >= 3 {
+                match fence {
+                    None => fence = Some((c, n)),
+                    Some((fc, fnum)) if fc == c && n >= fnum && t.chars().all(|x| x == c) => fence = None,
+                    _ => {}
+                }
+                prev = None;
+                continue;
+            }
+        }
+        if fence.is_some() {
+            continue;
+        }
+        if indent < 4 && t.starts_with('#') {
+            let level = t.chars().take_while(|c| *c == '#').count();
+            let rest = &t[level..];
+            if level <= 6 && (rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t')) {
+                // drop a closing "###"
+                let title = rest.trim();
+                let title = match title.trim_end_matches('#') {
+                    s if s.is_empty() || s.ends_with(' ') => s.trim_end(),
+                    _ => title,
+                };
+                out.push(Heading { line: i, level, title: title.to_string() });
+                prev = None;
+                continue;
+            }
+        }
+        if let Some((pl, title)) = prev.take() {
+            let setext = if !t.is_empty() && indent < 4 && t.chars().all(|c| c == '=') {
+                Some(1)
+            } else if t.len() >= 2 && indent < 4 && t.chars().all(|c| c == '-') {
+                Some(2)
+            } else {
+                None
+            };
+            if let Some(level) = setext {
+                out.push(Heading { line: pl, level, title });
+                continue;
+            }
+        }
+        let plain = !t.is_empty() && indent < 4 && marker(line).is_none() && !t.starts_with('|');
+        prev = plain.then(|| (i, t.to_string()));
+    }
+    out
+}
+
 /// Toggle `mark` (e.g. `**`) around `text`: unwrap if it is already wrapped.
 pub fn toggle_wrap(text: &str, mark: &str) -> String {
     let n = mark.len();
@@ -114,6 +185,24 @@ mod tests {
         assert_eq!(next("2024.01 report"), None);
         assert_eq!(next("* * *"), None); // horizontal rule
         assert_eq!(next("- - -"), None);
+    }
+
+    #[test]
+    fn outline_headings() {
+        let text = "# Title\n\nintro\n## Part one ##\n```sh\n# not a heading\n```\nSetext\n======\n\
+                    Sub\n---\n- item\n---\n#nospace\n####### seven\n    # indented code\n### \n~~~\n## in tilde\n~~~\n## Last";
+        let got: Vec<(usize, usize, String)> = headings(text.lines()).into_iter().map(|h| (h.line, h.level, h.title)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, 1, "Title".into()),
+                (3, 2, "Part one".into()),
+                (7, 1, "Setext".into()),
+                (9, 2, "Sub".into()),
+                (16, 3, "".into()),
+                (20, 2, "Last".into()),
+            ]
+        );
     }
 
     #[test]

@@ -15,6 +15,10 @@ arboard = "3"
 notify = "6"
 miniz_oxide = "0.8"
 time = { version = "0.3", features = ["local-offset"] }
+# Markdown preview (egui_commonmark 0.18 = egui 0.29); images: png/jpeg/gif only
+egui_commonmark = { version = "0.18", default-features = false, features = ["pulldown_cmark", "load-images"] }
+egui_extras = { version = "0.29", default-features = false, features = ["image", "file"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
 
 [profile.release]
 opt-level = 3
