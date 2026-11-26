@@ -111,6 +111,13 @@ const MM_LH: f32 = 3.0;
 const MM_CW: f32 = 1.3;
 const SB_W: f32 = 12.0;
 
+/// egui snaps every glyph to whole physical pixels, so the column width must be snapped
+/// too, or carets and selections drift away from the text along the line.
+fn char_width(fonts: &egui::epaint::text::Fonts, font: &FontId) -> f32 {
+    let ppp = fonts.pixels_per_point();
+    (fonts.glyph_width(font, 'M') * ppp).round() / ppp
+}
+
 pub fn show(ui: &mut Ui, doc: &mut Document, view: &mut View, cx: &Ctx) -> Response {
     let rect = ui.available_rect_before_wrap();
     let resp = ui.interact(rect, cx.id, Sense::click_and_drag());
@@ -121,7 +128,7 @@ pub fn show(ui: &mut Ui, doc: &mut Document, view: &mut View, cx: &Ctx) -> Respo
         )
     });
     let font = FontId::monospace(cx.settings.font_size);
-    let (cw, row_h) = ui.fonts(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
+    let (cw, row_h) = ui.fonts(|f| (char_width(f, &font), f.row_height(&font)));
     let lh = (row_h * cx.settings.line_spacing).round().max(1.0);
     let tab = doc.tab_size;
     let nlines = doc.rope.len_lines();
@@ -824,5 +831,29 @@ pub fn vcs_color(kind: Kind) -> Color32 {
         Kind::Insert => Color32::from_rgb(0x55, 0x9b, 0x4f),
         Kind::Replace => Color32::from_rgb(0x43, 0x80, 0xb8),
         Kind::Delete => Color32::from_rgb(0xb0, 0x5a, 0x5a),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::epaint::text::Fonts;
+    use egui::FontDefinitions;
+
+    #[test]
+    fn caret_columns_match_laid_out_glyphs() {
+        for ppp in [1.0, 1.25, 1.5, 2.0] {
+            let fonts = Fonts::new(ppp, 8192, FontDefinitions::default());
+            for size in [12.0, 13.0, 14.0, 15.0, 16.0] {
+                let font = FontId::monospace(size);
+                let cw = char_width(&fonts, &font);
+                let job = LayoutJob::simple_singleline("x".repeat(200), font, Color32::WHITE);
+                let galley = fonts.layout_job(job);
+                for (i, g) in galley.rows[0].glyphs.iter().enumerate() {
+                    let off = g.pos.x - i as f32 * cw;
+                    assert!(off.abs() < 0.01, "ppp {ppp}, size {size}: column {i} is {off} points off");
+                }
+            }
+        }
     }
 }
