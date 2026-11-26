@@ -256,6 +256,9 @@ pub struct App {
     find: Find,
     clip_history: Vec<String>,
     line_clip: Option<String>,
+    /// Paste shortcut tracking for clipboards with only an image or files (see handle_input).
+    paste_seen: bool,
+    v_press_seen: bool,
     pending: Option<Pending>,
     allow_quit: bool,
     title: String,
@@ -344,6 +347,8 @@ impl App {
             find: Find { case: false, ..Default::default() },
             clip_history: vec![],
             line_clip: None,
+            paste_seen: false,
+            v_press_seen: false,
             pending: None,
             allow_quit: false,
             title: String::new(),
@@ -872,6 +877,15 @@ impl App {
             Action::Text(t) => self.cur().doc.type_text(&t),
             Action::Paste(t) => {
                 let norm = t.replace("\r\n", "\n");
+                if self.cur().doc.markdown {
+                    if self.cur().doc.paste_url(&norm) {
+                        return;
+                    }
+                    if let Some(files) = crate::markdown::file_uris(&norm) {
+                        let links = self.file_links(&files);
+                        return self.cur().doc.replace_selections(&links);
+                    }
+                }
                 let line = self.line_clip.as_deref() == Some(norm.as_str());
                 self.cur().doc.paste(&norm, line);
             }
@@ -1125,6 +1139,24 @@ impl App {
             self.double_ctrl = false;
         }
         self.ctrl_prev = mods.ctrl;
+        // With only an image or files on the clipboard, egui-winit swallows Ctrl+V without a
+        // Paste event; all that arrives is the V key's release, with no press before it.
+        let mut paste_media = false;
+        for ev in &events {
+            match ev {
+                Event::Paste(_) => self.paste_seen = true,
+                Event::Key { key: Key::V, pressed: true, .. } => self.v_press_seen = true,
+                Event::Key { key: Key::V, pressed: false, .. } => {
+                    paste_media = !self.v_press_seen && !self.paste_seen;
+                    self.v_press_seen = false;
+                    self.paste_seen = false;
+                }
+                _ => {}
+            }
+        }
+        if paste_media && editor_focused && !left_focused && !modal && self.tabs[self.active].doc.markdown {
+            self.paste_media(ctx);
+        }
         for ev in events {
             let ed = editor_focused && !modal;
             match &ev {
@@ -1174,9 +1206,87 @@ impl App {
             self.settings.font_size = (self.settings.font_size * zoom).clamp(6.0, 48.0);
         }
         // Drag & drop
-        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        let mut dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        if self.tabs[self.active].doc.markdown && self.tabs[self.active].diff.is_none() {
+            // images dropped on a Markdown file are linked, not opened
+            let (images, rest) = dropped.into_iter().partition(|p| p.is_file() && crate::markdown::is_image(&p.to_string_lossy()));
+            dropped = rest;
+            let images: Vec<PathBuf> = images;
+            if !images.is_empty() {
+                let links = self.file_links(&images);
+                self.run(ctx, Action::Paste(links));
+            }
+        }
         for p in dropped {
             self.open_path(&p);
+        }
+    }
+
+    /// Markdown links to files, relative to the current file: `![name](path)` for images.
+    fn file_links(&self, files: &[PathBuf]) -> String {
+        let dir = self.tabs[self.active].doc.path.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf);
+        let links: Vec<String> = files
+            .iter()
+            .map(|f| {
+                let dest = match &dir {
+                    Some(d) => crate::markdown::rel_path(d, f),
+                    None => f.to_string_lossy().replace('\\', "/"),
+                };
+                let img = crate::markdown::is_image(&dest);
+                let name = if img { f.file_stem() } else { f.file_name() };
+                crate::markdown::link_to(&name.unwrap_or_default().to_string_lossy(), &dest)
+            })
+            .collect();
+        links.join("\n")
+    }
+
+    /// Ctrl+V in a Markdown file with no text on the clipboard: link copied files, or save a
+    /// copied image as `images/<file>-<time>.png` next to the file and link it.
+    fn paste_media(&mut self, ctx: &egui::Context) {
+        let Ok(mut cb) = arboard::Clipboard::new() else { return };
+        if let Ok(files) = cb.get().file_list() {
+            if !files.is_empty() {
+                let links = self.file_links(&files);
+                return self.run(ctx, Action::Paste(links));
+            }
+        }
+        let Ok(img) = cb.get_image() else { return };
+        let Some(path) = self.tabs[self.active].doc.path.clone() else {
+            return self.set_status(ctx, "Save the file first to paste images into it");
+        };
+        let dir = path.parent().unwrap_or(Path::new(".")).join("images");
+        let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+        let ts = format!(
+            "{:04}{:02}{:02}-{:02}{:02}{:02}",
+            now.year(),
+            now.month() as u8,
+            now.day(),
+            now.hour(),
+            now.minute(),
+            now.second()
+        );
+        let mut file = dir.join(format!("{stem}-{ts}.png"));
+        for n in 2.. {
+            if !file.exists() {
+                break;
+            }
+            file = dir.join(format!("{stem}-{ts}-{n}.png"));
+        }
+        let saved = image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned())
+            .ok_or_else(|| "unexpected image data".to_string())
+            .and_then(|im| {
+                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                im.save(&file).map_err(|e| e.to_string())
+            });
+        match saved {
+            Ok(()) => {
+                let links = self.file_links(&[file.clone()]);
+                self.run(ctx, Action::Paste(links));
+                let name = file.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                self.set_status(ctx, format!("Image saved as images/{name}"));
+            }
+            Err(e) => self.set_status(ctx, format!("Cannot save the pasted image: {e}")),
         }
     }
 

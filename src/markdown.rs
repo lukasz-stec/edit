@@ -160,9 +160,116 @@ pub fn toggle_wrap(text: &str, mark: &str) -> String {
     }
 }
 
+/// A single pasted URL (`https://…`, `www.…`, `mailto:…`), trimmed.
+pub fn as_url(text: &str) -> Option<&str> {
+    let t = text.trim();
+    let lower = t.to_ascii_lowercase();
+    let scheme = ["http://", "https://", "ftp://", "file://", "mailto:", "www."].iter().any(|s| lower.starts_with(s));
+    (scheme && t.len() > 7 && !t.chars().any(char::is_whitespace)).then_some(t)
+}
+
+/// Whether a path or URL names an image (query and fragment ignored).
+pub fn is_image(path: &str) -> bool {
+    let p = path.split(['?', '#']).next().unwrap_or(path).to_ascii_lowercase();
+    [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"].iter().any(|e| p.ends_with(e))
+}
+
+/// A link destination: `<…>` when it contains spaces or parentheses.
+pub fn link_dest(dest: &str) -> String {
+    if dest.contains([' ', '(', ')']) {
+        format!("<{dest}>")
+    } else {
+        dest.to_string()
+    }
+}
+
+/// `![name](dest)` for an image, `[name](dest)` otherwise.
+pub fn link_to(name: &str, dest: &str) -> String {
+    let bang = if is_image(dest) { "!" } else { "" };
+    format!("{bang}[{name}]({})", link_dest(dest))
+}
+
+/// `path` relative to the folder `dir`, with `/` separators; absolute when there's no
+/// common root (another drive).
+pub fn rel_path(dir: &std::path::Path, path: &std::path::Path) -> String {
+    use std::path::Component;
+    let a: Vec<Component> = dir.components().collect();
+    let b: Vec<Component> = path.components().collect();
+    let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    // nothing in common, or a different Windows drive: absolute
+    if common == 0 || matches!(b.first(), Some(Component::Prefix(_))) && common < 2 {
+        return path.to_string_lossy().replace('\\', "/");
+    }
+    let mut parts: Vec<String> = a[common..].iter().map(|_| "..".to_string()).collect();
+    parts.extend(b[common..].iter().map(|c| c.as_os_str().to_string_lossy().into_owned()));
+    parts.join("/")
+}
+
+/// Paths from pasted `file://` URIs, one per line (how Linux file managers copy files).
+pub fn file_uris(text: &str) -> Option<Vec<std::path::PathBuf>> {
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
+    if lines.is_empty() {
+        return None;
+    }
+    lines
+        .iter()
+        .map(|l| {
+            let p = l.strip_prefix("file://")?;
+            let p = percent_decode(p);
+            // file:///C:/x on Windows
+            let p = if p.len() > 2 && p.as_bytes()[0] == b'/' && p.as_bytes()[2] == b':' { p[1..].to_string() } else { p };
+            Some(std::path::PathBuf::from(p))
+        })
+        .collect()
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match (b[i], b.get(i + 1).and_then(|c| hex(*c)), b.get(i + 2).and_then(|c| hex(*c))) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, _, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paste_helpers() {
+        assert_eq!(as_url(" https://example.com/a?b=1 \n"), Some("https://example.com/a?b=1"));
+        assert_eq!(as_url("www.rust-lang.org"), Some("www.rust-lang.org"));
+        assert_eq!(as_url("https://a.com b"), None);
+        assert_eq!(as_url("see https://a.com"), None);
+        assert!(is_image("https://x.org/cat.PNG?size=2"));
+        assert!(!is_image("https://x.org/cat.html"));
+        assert_eq!(link_to("cat", "images/cat 1.png"), "![cat](<images/cat 1.png>)");
+        assert_eq!(link_to("doc", "doc.pdf"), "[doc](doc.pdf)");
+        let p = std::path::Path::new;
+        if cfg!(windows) {
+            assert_eq!(rel_path(p(r"C:\notes"), p(r"C:\notes\img\a.png")), "img/a.png");
+            assert_eq!(rel_path(p(r"C:\notes\sub"), p(r"C:\pics\a.png")), "../../pics/a.png");
+            assert_eq!(rel_path(p(r"C:\notes"), p(r"D:\a.png")), "D:/a.png");
+        } else {
+            assert_eq!(rel_path(p("/home/u/notes"), p("/home/u/notes/img/a.png")), "img/a.png");
+            assert_eq!(rel_path(p("/home/u/notes/sub"), p("/home/u/pics/a.png")), "../../pics/a.png");
+        }
+        assert_eq!(file_uris("file:///home/u/my%20cat.png\nfile:///tmp/b.txt"), Some(vec!["/home/u/my cat.png".into(), "/tmp/b.txt".into()]));
+        assert_eq!(file_uris("file:///C:/x/a.png"), Some(vec!["C:/x/a.png".into()]));
+        assert_eq!(file_uris("hello"), None);
+    }
 
     fn next(line: &str) -> Option<(usize, String)> {
         marker(line).map(|m| (m.len, m.next))

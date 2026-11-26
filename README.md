@@ -59,6 +59,9 @@ Pass files or a folder on the command line: `edit path/to/project path/to/file.r
   `.md` file): Enter continues lists (`-`, `1.` numbered on, `- [ ]` tasks) and `>` quotes,
   Enter on an empty item ends the list, Tab nests an item, typing ```` ``` ```` adds the
   closing fence, `*` `_` `~` wrap a selection, `Ctrl+B` / `Ctrl+I` toggle bold / italic.
+  **Smart paste**: a URL pasted over selected text makes a link, an image URL becomes
+  `![](url)`, copied files become links, and a copied image (a screenshot) is saved to
+  `images/` next to the file and linked; image files dropped on the editor are linked too.
   **Live preview** beside the file (`Alt+Shift+M`; follows the editor's scrolling, shows
   local images) and an **outline** of the headings in the sidebar (`Ctrl+F12` to search them).
 - **Follows the disk**: the sidebar updates when files are created, deleted or renamed,

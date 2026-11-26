@@ -784,6 +784,34 @@ impl Document {
 
     /// Markdown bold/italic (`mark` = `**` / `*`): toggle it around each selection, or
     /// insert an empty pair at a caret.
+    /// Markdown smart paste of a URL: over selected text it becomes `[text](url)`; an image
+    /// URL with nothing selected becomes `![](url)` with the caret in the alt text.
+    /// Returns false when this is an ordinary paste.
+    pub fn paste_url(&mut self, text: &str) -> bool {
+        let Some(url) = crate::markdown::as_url(text) else { return false };
+        let rope = &self.rope;
+        let all_selected = self.sels.iter().all(|s| !s.is_empty() && !rope.slice(s.start()..s.end()).chars().any(|c| c == '\n'));
+        let none_selected = self.sels.iter().all(|s| s.is_empty());
+        let dest = crate::markdown::link_dest(url);
+        let edits = if all_selected {
+            self.sels
+                .iter()
+                .map(|s| {
+                    let inner = rope.slice(s.start()..s.end()).to_string();
+                    // pasting a URL over a URL just replaces it
+                    let t = if crate::markdown::as_url(&inner).is_some() { url.to_string() } else { format!("[{inner}]({dest})") };
+                    Edit::replace(s.start(), s.end(), t)
+                })
+                .collect()
+        } else if none_selected && crate::markdown::is_image(url) {
+            self.sels.iter().map(|s| Edit { start: s.head, end: s.head, text: format!("![]({dest})"), anchor: 2, head: 2 }).collect()
+        } else {
+            return false;
+        };
+        self.apply(EditKind::Other, edits);
+        true
+    }
+
     pub fn toggle_emphasis(&mut self, mark: &str) {
         let rope = &self.rope;
         let len = rope.len_chars();
@@ -1703,6 +1731,26 @@ mod tests {
         d.toggle_emphasis("*");
         assert_eq!(d.rope.to_string(), "a**b");
         assert_eq!(ranges(&d), vec![(2, 2)]);
+    }
+
+    #[test]
+    fn markdown_paste_url() {
+        let mut d = doc("see the docs here", &[(8, 12)]);
+        assert!(d.paste_url("https://docs.rs\n"));
+        assert_eq!(d.rope.to_string(), "see the [docs](https://docs.rs) here");
+        assert_eq!(ranges(&d), vec![(31, 31)]);
+        d.undo();
+        assert_eq!(d.rope.to_string(), "see the docs here");
+        let mut d = doc("a ", &[(2, 2)]);
+        assert!(d.paste_url("https://x.org/cat.png"));
+        assert_eq!(d.rope.to_string(), "a ![](https://x.org/cat.png)");
+        assert_eq!(ranges(&d), vec![(4, 4)]); // in the alt text
+        let mut d = doc("a ", &[(2, 2)]);
+        assert!(!d.paste_url("https://x.org/page")); // plain paste
+        assert!(!d.paste_url("not a url"));
+        let mut d = doc("old https://a.com", &[(4, 17)]);
+        assert!(d.paste_url("https://b.com"));
+        assert_eq!(d.rope.to_string(), "old https://b.com");
     }
 
     #[test]
