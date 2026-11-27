@@ -67,6 +67,11 @@ Pass files or a folder on the command line: `edit path/to/project path/to/file.r
   `images/` next to the file and linked; image files dropped on the editor are linked too.
   **Live preview** beside the file (`Alt+Shift+M`; follows the editor's scrolling, shows
   local images) and an **outline** of the headings in the sidebar (`Ctrl+F12` to search them).
+- **Spell checking** (English): misspelled words get a green wavy underline, in prose files
+  (plain text, Markdown) and in comments and strings of code; identifiers, URLs, paths and
+  code spans are left alone. `Alt+Enter` on a word lists suggestions and "Add to dictionary"
+  (kept in `dictionary.txt` in the settings folder), `F2` / `Shift+F2` jump between problems.
+  Toggle it in the View menu.
 - **Follows the disk**: the sidebar updates when files are created, deleted or renamed,
   and open files reload when another program changes them (your unsaved edits are
   never overwritten; you get a warning instead).
@@ -111,6 +116,8 @@ On macOS, `Cmd` works wherever `Ctrl` is listed.
 | `Ctrl+Shift+U` | Toggle case |
 | `F9` | Sort lines |
 | `Ctrl+Shift+V` | Paste from clipboard history |
+| `Alt+Enter` | Spelling suggestions for the word at the caret |
+| `F2` / `Shift+F2` | Next / previous spelling problem |
 | `Ctrl+Z` / `Ctrl+Shift+Z`, `Ctrl+Y` | Undo / redo |
 
 ### Multiple carets and column selection
@@ -150,7 +157,9 @@ Session, hot-exit backups and your own syntaxes and themes live in:
 - Linux: `$XDG_CONFIG_HOME/edit` or `~/.config/edit`
 
 Drop Sublime `.sublime-syntax` files into `syntaxes/` and `.tmTheme` files into
-`themes/` there to add languages and color schemes.
+`themes/` there to add languages and color schemes. Words you add to the spelling
+dictionary are in `dictionary.txt` (one per line). The built-in English dictionary is the
+SCOWL-based en_US Hunspell dictionary ([license](assets/dict/LICENSE)).
 
 ## Building from source
 

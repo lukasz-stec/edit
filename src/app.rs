@@ -42,6 +42,7 @@ enum PMode {
     DiffTab,
     Label,
     Headings,
+    Spelling,
 }
 
 #[derive(Clone)]
@@ -54,6 +55,8 @@ enum PAction {
     Clip(usize),
     Label(String),
     DiffTab(usize),
+    SpellReplace(String),
+    SpellAdd(String),
 }
 
 struct PItem {
@@ -270,6 +273,10 @@ pub struct App {
     camel_humps: bool,
     /// Markdown editing (lists, fences, Ctrl+B/I) in Markdown files.
     markdown: bool,
+    speller: crate::spell::Speller,
+    spell_on: bool,
+    /// The word Alt+Enter offers fixes for: (doc id, version, start, end, word).
+    spell_target: Option<(u64, u64, usize, usize, String)>,
     /// Markdown preview pane beside Markdown files.
     md_preview: bool,
     preview: Preview,
@@ -358,6 +365,9 @@ impl App {
             status: None,
             camel_humps: true,
             markdown: false,
+            speller: crate::spell::Speller::new(),
+            spell_on: true,
+            spell_target: None,
             md_preview: false,
             preview: Preview::default(),
             outline: (0, u64::MAX, vec![]),
@@ -423,6 +433,9 @@ impl App {
         }
         if let Some(m) = s.markdown {
             self.markdown = m;
+        }
+        if let Some(m) = s.spell {
+            self.spell_on = m;
         }
         if let Some(c) = s.camel_humps {
             self.camel_humps = c;
@@ -502,6 +515,7 @@ impl App {
             camel_humps: Some(self.camel_humps),
             markdown: Some(self.markdown),
             md_preview: Some(self.md_preview),
+            spell: Some(self.spell_on),
         }
     }
 
@@ -1041,6 +1055,37 @@ impl App {
                 }
             }
             GotoHeading => self.open_palette(PMode::Headings, ""),
+            ToggleSpellCheck => {
+                self.spell_on = !self.spell_on;
+                let msg = if self.spell_on {
+                    "Spell checking ON: Alt+Enter on an underlined word for suggestions, F2 / Shift+F2 to jump"
+                } else {
+                    "Spell checking OFF"
+                };
+                self.set_status(ctx, msg);
+            }
+            SpellingFix => match self.typo_at_caret() {
+                Some((s, e, w)) => {
+                    let d = &self.tabs[self.active].doc;
+                    self.spell_target = Some((d.id, d.version, s, e, w));
+                    self.open_palette(PMode::Spelling, "");
+                }
+                None if !self.spell_on => self.set_status(ctx, "Spell checking is off (View → Toggle Spell Checking)"),
+                None => self.set_status(ctx, "No spelling problem at the caret"),
+            },
+            NextTypo | PrevTypo => {
+                if !self.spell_on {
+                    return self.set_status(ctx, "Spell checking is off (View → Toggle Spell Checking)");
+                }
+                match self.find_typo(cmd == NextTypo) {
+                    Some((s, e)) => {
+                        let t = self.cur();
+                        t.doc.set_sels(vec![Sel::new(s, e)], 0);
+                        t.view.scroll_to_caret = true;
+                    }
+                    None => self.set_status(ctx, "No spelling problems"),
+                }
+            }
             ToggleMarkdown => {
                 self.markdown = !self.markdown;
                 let msg = if self.markdown {
@@ -1220,6 +1265,62 @@ impl App {
         for p in dropped {
             self.open_path(&p);
         }
+    }
+
+    /// The misspelled word at the primary caret: (start, end, word).
+    fn typo_at_caret(&self) -> Option<(usize, usize, String)> {
+        if !self.spell_on {
+            return None;
+        }
+        let t = &self.tabs[self.active];
+        let rope = &t.doc.rope;
+        let head = t.doc.primary_sel().head;
+        let l = rope.char_to_line(head);
+        let ls = rope.line_to_char(l);
+        let prose = t.view.cache.prose.get(l)?;
+        let (a, b, w) = crate::spell::word_at(&rope.line(l).to_string(), prose, head - ls)?;
+        (!self.speller.check(&w)).then(|| (ls + a, ls + b, w))
+    }
+
+    /// The next (or previous) misspelled word from the primary selection, wrapping around.
+    fn find_typo(&mut self, forward: bool) -> Option<(usize, usize)> {
+        // comments and strings are only known for highlighted lines: highlight the rest
+        let theme = self.syn.theme(&self.theme_name);
+        let t = &mut self.tabs[self.active];
+        let n = t.doc.rope.len_lines();
+        t.view.cache.ensure(&t.doc.rope, n, &self.syn, theme, std::time::Duration::from_millis(500));
+        let t = &self.tabs[self.active];
+        let rope = &t.doc.rope;
+        let lines = t.view.cache.prose.len().min(n);
+        if lines == 0 {
+            return None;
+        }
+        let typos = |l: usize| -> Vec<(usize, usize)> {
+            let p = &t.view.cache.prose[l];
+            if !p.iter().any(|x| x.1) {
+                return vec![];
+            }
+            let ls = rope.line_to_char(l);
+            self.speller.typos(&rope.line(l).to_string(), p).into_iter().map(|(a, b)| (ls + a, ls + b)).collect()
+        };
+        let sel = t.doc.primary_sel();
+        let cl = rope.char_to_line(sel.head).min(lines - 1);
+        for k in 0..=lines {
+            let l = if forward { (cl + k) % lines } else { (cl + lines * 2 - k) % lines };
+            let found = typos(l);
+            let pick = |r: &&(usize, usize)| match (k, forward, r.0) {
+                (0, true, a) => a >= sel.end(),
+                (0, false, a) => a < sel.start(),
+                (k, true, a) if k == lines => a < sel.end(),
+                (k, false, a) if k == lines => a >= sel.start(),
+                _ => true,
+            };
+            let hit = if forward { found.iter().find(pick) } else { found.iter().rev().find(pick) };
+            if let Some(&r) = hit {
+                return Some(r);
+            }
+        }
+        None
     }
 
     /// Markdown links to files, relative to the current file: `![name](path)` for images.
@@ -1562,6 +1663,17 @@ impl App {
                 let label = if text.is_empty() { "Type a name for the label".to_string() } else { format!("Put label “{text}”") };
                 return vec![PItem { label, detail: self.label_scope(), hits: vec![], action: PAction::Label(text.to_string()) }];
             }
+            PMode::Spelling => {
+                let Some((.., word)) = &self.spell_target else { return vec![] };
+                let suggestions = self.speller.suggest(word);
+                if suggestions.is_empty() {
+                    push("(no suggestions)".into(), String::new(), PAction::SpellReplace(word.clone()), query);
+                }
+                for s in suggestions {
+                    push(s.clone(), format!("for “{word}”"), PAction::SpellReplace(s), query);
+                }
+                push(format!("Add “{word}” to dictionary"), String::new(), PAction::SpellAdd(word.clone()), query);
+            }
             PMode::DiffTab => {
                 for (i, t) in self.tabs.iter().enumerate() {
                     if i != self.active {
@@ -1625,6 +1737,7 @@ impl App {
             PMode::Clipboard => "Paste from history…",
             PMode::DiffTab => "Compare with tab…",
             PMode::Headings => "Go to heading…",
+            PMode::Spelling => "Replace with…",
             PMode::Label => "Local History label, e.g. before refactoring…",
         };
         let colors = self.colors.clone();
@@ -1728,6 +1841,19 @@ impl App {
                     self.run(ctx, Action::Paste(t));
                 }
             }
+            PAction::SpellReplace(s) => {
+                if let Some((id, version, a, b, _)) = self.spell_target.take() {
+                    let d = &mut self.tabs[self.active].doc;
+                    if d.id == id && d.version == version {
+                        d.set_sels(vec![Sel::new(a, b)], 0);
+                        d.replace_selections(&s);
+                    }
+                }
+            }
+            PAction::SpellAdd(w) => match self.speller.add_word(&w) {
+                Ok(()) => self.set_status(ctx, format!("Added “{w}” to your dictionary")),
+                Err(e) => self.set_status(ctx, format!("Cannot add “{w}”: {e}")),
+            },
             PAction::DiffTab(i) => {
                 if let Some(t) = self.tabs.get(i) {
                     let (text, title) = (t.doc.rope.to_string(), format!("Tab: {}", t.doc.name()));
@@ -3124,6 +3250,11 @@ impl eframe::App for App {
         }
 
         self.sync_fs(ctx);
+        if self.speller.poll() {
+            ctx.request_repaint();
+        } else if self.speller.loading() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
         for t in &mut self.tabs {
             t.doc.markdown = self.markdown && is_markdown(t);
         }
@@ -3175,7 +3306,7 @@ impl eframe::App for App {
                     }
                 });
                 ui.menu_button("View", |ui| {
-                    for cmd in [Cmd::CommandPalette, Cmd::ToggleSidebar, Cmd::ToggleMinimap, Cmd::ZoomIn, Cmd::ZoomOut, Cmd::ZoomReset, Cmd::SelectTheme, Cmd::SetSyntax, Cmd::ToggleCamelHumps, Cmd::ToggleMarkdown, Cmd::MarkdownPreview, Cmd::GotoHeading] {
+                    for cmd in [Cmd::CommandPalette, Cmd::ToggleSidebar, Cmd::ToggleMinimap, Cmd::ZoomIn, Cmd::ZoomOut, Cmd::ZoomReset, Cmd::SelectTheme, Cmd::SetSyntax, Cmd::ToggleCamelHumps, Cmd::ToggleMarkdown, Cmd::MarkdownPreview, Cmd::GotoHeading, Cmd::ToggleSpellCheck, Cmd::NextTypo, Cmd::PrevTypo] {
                         item(ui, cmd, self);
                     }
                     if let Some(dir) = config_dir() {
@@ -3483,6 +3614,7 @@ impl eframe::App for App {
                     id: self.editor_id,
                     decor: None,
                     vcs,
+                    spell: self.spell_on.then_some(&self.speller),
                 };
                 let resp = editor::show(ui, &mut tab.doc, &mut tab.view, &cx);
                 if let Some((i, at)) = tab.view.vcs_click.take() {

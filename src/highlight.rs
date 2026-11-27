@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use syntect::highlighting::{
     Color, HighlightIterator, HighlightState, Highlighter, Theme, ThemeSet,
 };
-use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
+use syntect::parsing::{ParseState, Scope, ScopeStack, ScopeStackOp, SyntaxSet};
 
 /// Settings folder: `%APPDATA%\edit` on Windows, `~/Library/Application Support/edit` on
 /// macOS, `$XDG_CONFIG_HOME/edit` or `~/.config/edit` elsewhere.
@@ -80,20 +80,91 @@ pub struct LineCache {
     states: Vec<(ParseState, HighlightState)>,
     /// (char count, color) runs per line
     pub spans: Vec<Vec<(usize, Color32)>>,
+    /// (char count, prose?) runs per line: the text spell checking looks at.
+    pub prose: Vec<Vec<(usize, bool)>>,
+}
+
+/// Which text is prose: in text formats everything but code and links, in code only
+/// comments and strings.
+struct ProseScopes {
+    text: bool,
+    include: Vec<Scope>,
+    exclude: Vec<Scope>,
+}
+
+impl ProseScopes {
+    fn new(syntax: &str) -> Self {
+        let s = |names: &[&str]| names.iter().filter_map(|n| Scope::new(n).ok()).collect::<Vec<_>>();
+        let text = matches!(syntax, "Plain Text" | "Markdown" | "MultiMarkdown" | "Git Commit" | "Git Commit Message")
+            || syntax.contains("Markdown");
+        Self {
+            text,
+            include: s(&["comment", "string"]),
+            exclude: s(&[
+                "markup.raw",
+                "meta.code-fence",
+                "markup.underline.link",
+                "meta.link.reference",
+                "constant.other.reference.link",
+                "meta.tag",
+                "string.regexp",
+                "meta.interpolation",
+                "constant.character.escape",
+                "source",
+            ]),
+        }
+    }
+
+    fn is_prose(&self, stack: &ScopeStack) -> bool {
+        let scopes = stack.as_slice();
+        let has = |set: &[Scope]| scopes.iter().any(|s| set.iter().any(|p| p.is_prefix_of(*s)));
+        if self.text {
+            // "source.*" only excludes code embedded in a text format (fenced blocks)
+            !has(&self.exclude)
+        } else {
+            has(&self.include) && !has(&self.exclude[..self.exclude.len() - 1])
+        }
+    }
+}
+
+/// Walk a line's scope changes, starting from the scopes open at its start.
+fn prose_runs(line: &str, ops: &[(usize, ScopeStackOp)], mut stack: ScopeStack, scopes: &ProseScopes) -> Vec<(usize, bool)> {
+    let mut runs: Vec<(usize, bool)> = vec![];
+    let mut push = |text: &str, p: bool| {
+        let n = text.chars().count();
+        match runs.last_mut() {
+            Some(last) if last.1 == p => last.0 += n,
+            _ if n > 0 => runs.push((n, p)),
+            _ => {}
+        }
+    };
+    let mut pos = 0;
+    for (off, op) in ops {
+        let off = (*off).min(line.len());
+        if off > pos {
+            push(&line[pos..off], scopes.is_prose(&stack));
+            pos = off;
+        }
+        let _ = stack.apply(op);
+    }
+    push(&line[pos..], scopes.is_prose(&stack));
+    runs
 }
 
 impl LineCache {
     pub fn new(syntax: String) -> Self {
-        Self { syntax, states: vec![], spans: vec![] }
+        Self { syntax, states: vec![], spans: vec![], prose: vec![] }
     }
 
     pub fn invalidate(&mut self, line: usize) {
         self.spans.truncate(line);
+        self.prose.truncate(line);
         self.states.truncate(line + 1);
     }
 
     pub fn reset(&mut self) {
         self.spans.clear();
+        self.prose.clear();
         self.states.clear();
     }
 
@@ -105,10 +176,15 @@ impl LineCache {
         let hl = Highlighter::new(theme);
         if self.states.is_empty() {
             self.spans.clear();
+            self.prose.clear();
             self.states.push((ParseState::new(syntax), HighlightState::new(&hl, ScopeStack::new())));
         }
         let upto = upto.min(rope.len_lines());
+        if self.spans.len() >= upto {
+            return true;
+        }
         let fg = color(theme.settings.foreground.unwrap_or(Color::WHITE));
+        let scopes = ProseScopes::new(&self.syntax);
         let t0 = Instant::now();
         while self.spans.len() < upto {
             let i = self.spans.len();
@@ -116,6 +192,7 @@ impl LineCache {
             let slice = rope.line(i);
             let n = slice.len_chars();
             let mut spans = Vec::new();
+            let mut prose = Vec::new();
             if n > 5000 {
                 // Pathologically long line (minified file): don't parse it.
                 spans.push((n, fg));
@@ -126,6 +203,7 @@ impl LineCache {
                 }
                 match ps.parse_line(&line, &syn.ss) {
                     Ok(ops) => {
+                        prose = prose_runs(&line, &ops, hs.path.clone(), &scopes);
                         for (style, text) in HighlightIterator::new(&mut hs, &ops, &line, &hl) {
                             spans.push((text.chars().count(), color(style.foreground)));
                         }
@@ -134,6 +212,7 @@ impl LineCache {
                 }
             }
             self.spans.push(spans);
+            self.prose.push(prose);
             self.states.push((ps, hs));
             if t0.elapsed() > budget {
                 return false;
@@ -157,6 +236,8 @@ pub struct Colors {
     pub guide: Color32,
     pub find: Color32,
     pub occurrence: Color32,
+    /// Wavy underline under misspelled words (IntelliJ's green "typo").
+    pub typo: Color32,
     pub bracket: Color32,
     pub panel: Color32,
     pub dark: bool,
@@ -193,6 +274,7 @@ impl Colors {
             find: Color32::from_rgba_unmultiplied(230, 180, 40, 90),
             occurrence: lerp(bg, fg, 0.35),
             bracket: lerp(bg, fg, 0.6),
+            typo: if dark { Color32::from_rgb(0x6a, 0xab, 0x73) } else { Color32::from_rgb(0x3d, 0x8b, 0x4a) },
             panel: if dark { lerp(bg, Color32::BLACK, 0.25) } else { lerp(bg, Color32::from_gray(200), 0.4) },
             dark,
         }

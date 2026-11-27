@@ -15,6 +15,7 @@ mod markdown;
 mod search;
 mod selection;
 mod session;
+mod spell;
 mod text;
 mod watch;
 

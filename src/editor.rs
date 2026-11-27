@@ -104,6 +104,24 @@ pub struct Ctx<'a> {
     pub decor: Option<&'a Decor>,
     /// Changes against Git HEAD, drawn as gutter markers (left = HEAD, right = this text).
     pub vcs: &'a [Hunk],
+    /// Spell checker: misspelled words in prose get a wavy underline.
+    pub spell: Option<&'a crate::spell::Speller>,
+}
+
+/// Wavy underline from x0 to x1 at y.
+fn squiggle(p: &egui::Painter, x0: f32, x1: f32, y: f32, color: Color32) {
+    let (step, amp) = (2.0, 1.2);
+    let mut pts = vec![];
+    let mut x = x0;
+    let mut up = false;
+    while x <= x1 {
+        pts.push(pos2(x, if up { y - amp } else { y + amp }));
+        up = !up;
+        x += step;
+    }
+    if pts.len() > 1 {
+        p.add(egui::Shape::line(pts, Stroke::new(1.0_f32, color)));
+    }
 }
 
 const MINIMAP_W: f32 = 110.0;
@@ -650,6 +668,18 @@ pub fn show(ui: &mut Ui, doc: &mut Document, view: &mut View, cx: &Ctx) -> Respo
         if let Some(fv) = first_v {
             let galley = ui.fonts(|f| f.layout_job(job));
             tp.galley(pos2(x_of(fv), y + ty), galley, c.fg);
+        }
+        // spelling
+        if let (Some(sp), Some(prose)) = (cx.spell, view.cache.prose.get(l)) {
+            if prose.iter().any(|p| p.1) {
+                let text = rope.line(l).to_string();
+                for (a, b) in sp.typos(&text, prose) {
+                    let (va, vb) = (visual_col(rope, l, a, tab), visual_col(rope, l, b, tab));
+                    if vb > vstart && va < vend {
+                        squiggle(&tp, x_of(va), x_of(vb), y + ty + row_h - 1.0, c.typo);
+                    }
+                }
+            }
         }
     }
 

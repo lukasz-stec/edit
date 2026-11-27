@@ -34,6 +34,7 @@ pub struct Session {
     pub camel_humps: Option<bool>,
     pub markdown: Option<bool>,
     pub md_preview: Option<bool>,
+    pub spell: Option<bool>,
 }
 
 fn file_path() -> Option<PathBuf> {
@@ -90,6 +91,9 @@ impl Session {
         if let Some(b) = self.markdown {
             s += &format!("markdown\t{}\n", flag(b));
         }
+        if let Some(b) = self.spell {
+            s += &format!("spell\t{}\n", flag(b));
+        }
         if let Some(b) = self.camel_humps {
             s += &format!("camel\t{}\n", flag(b));
         }
@@ -121,6 +125,7 @@ impl Session {
                 "camel" => s.camel_humps = Some(val == "1"),
                 "markdown" => s.markdown = Some(val == "1"),
                 "preview" => s.md_preview = Some(val == "1"),
+                "spell" => s.spell = Some(val == "1"),
                 "active" => s.active = val.parse().unwrap_or(0),
                 "file" => {
                     let f: Vec<&str> = val.splitn(4, '\t').collect();
@@ -233,6 +238,7 @@ mod tests {
             camel_humps: Some(true),
             markdown: Some(true),
             md_preview: Some(false),
+            spell: Some(true),
         };
         assert_eq!(Session::parse(&s.to_text()), s);
     }

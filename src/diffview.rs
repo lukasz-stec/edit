@@ -214,6 +214,7 @@ pub fn show(ui: &mut egui::Ui, right: &mut Document, view: &mut View, st: &mut D
         id,
         decor: Some(decor),
         vcs: &[],
+        spell: None,
     };
     ui.allocate_new_ui(UiBuilder::new().max_rect(lrect), |ui| {
         editor::show(ui, &mut st.left, &mut st.left_view, &mk(cx.left_id, &[], &ldec));

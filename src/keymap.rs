@@ -80,6 +80,10 @@ pub enum Cmd {
     ToggleMarkdown,
     MarkdownPreview,
     GotoHeading,
+    ToggleSpellCheck,
+    SpellingFix,
+    NextTypo,
+    PrevTypo,
     InsertLineBelow,
     InsertLineAbove,
     GotoBracket,
@@ -99,7 +103,7 @@ impl Cmd {
             NewFile | OpenFile | OpenFolder | AddFolder | Save | SaveAs | SaveAll | CloseTab | NextTab | PrevTab
                 | CommandPalette | GotoAnything | GotoLine | Find | FindInFiles | ReplaceInFiles | Replace | FindNext | FindPrev
                 | ToggleSidebar | ToggleMinimap | SelectTheme | SetSyntax | PasteFromHistory | ZoomIn
-                | ZoomOut | ZoomReset | ToggleCamelHumps | ToggleMarkdown | MarkdownPreview | GotoHeading | ToggleIndentation | ToggleLineEndings | ToggleColumnMode | Quit
+                | ZoomOut | ZoomReset | ToggleCamelHumps | ToggleMarkdown | MarkdownPreview | GotoHeading | ToggleSpellCheck | SpellingFix | NextTypo | PrevTypo | ToggleIndentation | ToggleLineEndings | ToggleColumnMode | Quit
                 | DiffWithSaved | DiffWithHead | DiffWithClipboard | DiffWithFile | DiffWithTab | DiffTreeSelection | ShowDiff | ShowHistory | PutLabel | CloseDiff
                 | NextDiff | PrevDiff
         )
@@ -181,6 +185,10 @@ impl Cmd {
             ToggleMarkdown => "Preferences: Toggle Markdown Editing",
             MarkdownPreview => "Markdown: Toggle Preview",
             GotoHeading => "Markdown: Go to Heading…",
+            ToggleSpellCheck => "Preferences: Toggle Spell Checking",
+            SpellingFix => "Spelling: Show Suggestions…",
+            NextTypo => "Spelling: Next Problem",
+            PrevTypo => "Spelling: Previous Problem",
             InsertLineBelow => "Edit: Insert Line After",
             InsertLineAbove => "Edit: Insert Line Before",
             GotoBracket => "Goto Matching Bracket",
@@ -198,7 +206,7 @@ impl Cmd {
             Undo, Redo, SelectAll, SelectLine, ExpandSelection, ShrinkSelection,
             SelectNextOccurrence, UnselectOccurrence, SelectAllOccurrences, SplitIntoLines,
             AddCaretAbove, AddCaretBelow, CaretsAtLineEnds, ToggleColumnMode, Duplicate, DeleteLine, MoveLineUp, MoveLineDown,
-            ToggleComment, Indent, Outdent, JoinLines, SortLines, ToggleCase, MdBold, MdItalic, ToggleMarkdown, MarkdownPreview, GotoHeading, InsertLineBelow,
+            ToggleComment, Indent, Outdent, JoinLines, SortLines, ToggleCase, MdBold, MdItalic, ToggleMarkdown, MarkdownPreview, GotoHeading, ToggleSpellCheck, SpellingFix, NextTypo, PrevTypo, InsertLineBelow,
             InsertLineAbove, GotoBracket, NextTab, PrevTab, Quit,
             DiffWithSaved, DiffWithHead, DiffWithClipboard, DiffWithFile, DiffWithTab, DiffTreeSelection, ShowDiff, ShowHistory, PutLabel, CloseDiff,
             NextDiff, PrevDiff,
@@ -284,6 +292,9 @@ const BINDINGS: &[B] = &[
     B(Cmd::MdItalic, C, Key::I),
     B(Cmd::MarkdownPreview, A | S, Key::M),
     B(Cmd::GotoHeading, C, Key::F12),           // IntelliJ "File Structure"
+    B(Cmd::SpellingFix, A, Key::Enter),         // IntelliJ "Show Context Actions"
+    B(Cmd::NextTypo, 0, Key::F2),               // IntelliJ "Next Highlighted Error"
+    B(Cmd::PrevTypo, S, Key::F2),
     B(Cmd::InsertLineBelow, C, Key::Enter),
     B(Cmd::InsertLineBelow, S, Key::Enter),     // IntelliJ "Start New Line"
     B(Cmd::InsertLineAbove, C | S, Key::Enter),
