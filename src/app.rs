@@ -43,6 +43,7 @@ enum PMode {
     Label,
     Headings,
     Spelling,
+    DictWords,
 }
 
 #[derive(Clone)]
@@ -57,6 +58,7 @@ enum PAction {
     DiffTab(usize),
     SpellReplace(String),
     SpellAdd(String),
+    SpellRemove(String),
 }
 
 struct PItem {
@@ -1064,7 +1066,8 @@ impl App {
                 };
                 self.set_status(ctx, msg);
             }
-            SpellingFix => match self.typo_at_caret() {
+            // a misspelled word, or one from your dictionary (to take it out again)
+            SpellingFix => match self.word_at_caret().filter(|w| !self.speller.check(&w.2) || self.speller.is_user_word(&w.2)) {
                 Some((s, e, w)) => {
                     let d = &self.tabs[self.active].doc;
                     self.spell_target = Some((d.id, d.version, s, e, w));
@@ -1073,6 +1076,14 @@ impl App {
                 None if !self.spell_on => self.set_status(ctx, "Spell checking is off (View → Toggle Spell Checking)"),
                 None => self.set_status(ctx, "No spelling problem at the caret"),
             },
+            EditDictionary => match self.speller.ensure_file() {
+                Ok(p) => {
+                    self.open_path(&p);
+                    self.set_status(ctx, "One word per line; saved changes apply right away");
+                }
+                Err(e) => self.set_status(ctx, format!("Cannot open your dictionary: {e}")),
+            },
+            RemoveDictWord => self.open_palette(PMode::DictWords, ""),
             NextTypo | PrevTypo => {
                 if !self.spell_on {
                     return self.set_status(ctx, "Spell checking is off (View → Toggle Spell Checking)");
@@ -1267,8 +1278,8 @@ impl App {
         }
     }
 
-    /// The misspelled word at the primary caret: (start, end, word).
-    fn typo_at_caret(&self) -> Option<(usize, usize, String)> {
+    /// The checked word at the primary caret, spelled right or wrong: (start, end, word).
+    fn word_at_caret(&self) -> Option<(usize, usize, String)> {
         if !self.spell_on {
             return None;
         }
@@ -1279,7 +1290,7 @@ impl App {
         let ls = rope.line_to_char(l);
         let prose = t.view.cache.prose.get(l)?;
         let (a, b, w) = crate::spell::word_at(&rope.line(l).to_string(), prose, head - ls)?;
-        (!self.speller.check(&w)).then(|| (ls + a, ls + b, w))
+        Some((ls + a, ls + b, w))
     }
 
     /// The next (or previous) misspelled word from the primary selection, wrapping around.
@@ -1665,6 +1676,11 @@ impl App {
             }
             PMode::Spelling => {
                 let Some((.., word)) = &self.spell_target else { return vec![] };
+                if self.speller.check(word) {
+                    // accepted only because it's in your dictionary
+                    push(format!("Remove “{word}” from dictionary"), String::new(), PAction::SpellRemove(word.clone()), query);
+                    return items.into_iter().map(|x| x.1).collect();
+                }
                 let suggestions = self.speller.suggest(word);
                 if suggestions.is_empty() {
                     push("(no suggestions)".into(), String::new(), PAction::SpellReplace(word.clone()), query);
@@ -1673,6 +1689,20 @@ impl App {
                     push(s.clone(), format!("for “{word}”"), PAction::SpellReplace(s), query);
                 }
                 push(format!("Add “{word}” to dictionary"), String::new(), PAction::SpellAdd(word.clone()), query);
+            }
+            PMode::DictWords => {
+                let words = self.speller.user_words();
+                if words.is_empty() {
+                    return vec![PItem {
+                        label: "Your dictionary is empty".into(),
+                        detail: "add words with Alt+Enter or Spelling: Edit Your Dictionary".into(),
+                        hits: vec![],
+                        action: PAction::Cmd(Cmd::EditDictionary),
+                    }];
+                }
+                for w in words {
+                    push(w.clone(), "Enter: remove".into(), PAction::SpellRemove(w), query);
+                }
             }
             PMode::DiffTab => {
                 for (i, t) in self.tabs.iter().enumerate() {
@@ -1738,6 +1768,7 @@ impl App {
             PMode::DiffTab => "Compare with tab…",
             PMode::Headings => "Go to heading…",
             PMode::Spelling => "Replace with…",
+            PMode::DictWords => "Remove a word from your dictionary…",
             PMode::Label => "Local History label, e.g. before refactoring…",
         };
         let colors = self.colors.clone();
@@ -1853,6 +1884,10 @@ impl App {
             PAction::SpellAdd(w) => match self.speller.add_word(&w) {
                 Ok(()) => self.set_status(ctx, format!("Added “{w}” to your dictionary")),
                 Err(e) => self.set_status(ctx, format!("Cannot add “{w}”: {e}")),
+            },
+            PAction::SpellRemove(w) => match self.speller.remove_word(&w) {
+                Ok(()) => self.set_status(ctx, format!("Removed “{w}” from your dictionary")),
+                Err(e) => self.set_status(ctx, format!("Cannot remove “{w}”: {e}")),
             },
             PAction::DiffTab(i) => {
                 if let Some(t) = self.tabs.get(i) {
@@ -3306,7 +3341,7 @@ impl eframe::App for App {
                     }
                 });
                 ui.menu_button("View", |ui| {
-                    for cmd in [Cmd::CommandPalette, Cmd::ToggleSidebar, Cmd::ToggleMinimap, Cmd::ZoomIn, Cmd::ZoomOut, Cmd::ZoomReset, Cmd::SelectTheme, Cmd::SetSyntax, Cmd::ToggleCamelHumps, Cmd::ToggleMarkdown, Cmd::MarkdownPreview, Cmd::GotoHeading, Cmd::ToggleSpellCheck, Cmd::NextTypo, Cmd::PrevTypo] {
+                    for cmd in [Cmd::CommandPalette, Cmd::ToggleSidebar, Cmd::ToggleMinimap, Cmd::ZoomIn, Cmd::ZoomOut, Cmd::ZoomReset, Cmd::SelectTheme, Cmd::SetSyntax, Cmd::ToggleCamelHumps, Cmd::ToggleMarkdown, Cmd::MarkdownPreview, Cmd::GotoHeading, Cmd::ToggleSpellCheck, Cmd::NextTypo, Cmd::PrevTypo, Cmd::EditDictionary, Cmd::RemoveDictWord] {
                         item(ui, cmd, self);
                     }
                     if let Some(dir) = config_dir() {

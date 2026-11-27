@@ -71,7 +71,9 @@ Pass files or a folder on the command line: `edit path/to/project path/to/file.r
   (plain text, Markdown) and in comments and strings of code; identifiers, URLs, paths and
   code spans are left alone. `Alt+Enter` on a word lists suggestions and "Add to dictionary"
   (kept in `dictionary.txt` in the settings folder), `F2` / `Shift+F2` jump between problems.
-  Toggle it in the View menu.
+  **Your dictionary**: Spelling: Edit Your Dictionary opens it to add or delete many words at
+  once (saved changes apply right away); Spelling: Remove Word from Dictionary… or `Alt+Enter`
+  on an added word takes it out again. Toggle spell checking in the View menu.
 - **Follows the disk**: the sidebar updates when files are created, deleted or renamed,
   and open files reload when another program changes them (your unsaved edits are
   never overwritten; you get a warning instead).

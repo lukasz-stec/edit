@@ -84,6 +84,8 @@ pub enum Cmd {
     SpellingFix,
     NextTypo,
     PrevTypo,
+    EditDictionary,
+    RemoveDictWord,
     InsertLineBelow,
     InsertLineAbove,
     GotoBracket,
@@ -103,7 +105,7 @@ impl Cmd {
             NewFile | OpenFile | OpenFolder | AddFolder | Save | SaveAs | SaveAll | CloseTab | NextTab | PrevTab
                 | CommandPalette | GotoAnything | GotoLine | Find | FindInFiles | ReplaceInFiles | Replace | FindNext | FindPrev
                 | ToggleSidebar | ToggleMinimap | SelectTheme | SetSyntax | PasteFromHistory | ZoomIn
-                | ZoomOut | ZoomReset | ToggleCamelHumps | ToggleMarkdown | MarkdownPreview | GotoHeading | ToggleSpellCheck | SpellingFix | NextTypo | PrevTypo | ToggleIndentation | ToggleLineEndings | ToggleColumnMode | Quit
+                | ZoomOut | ZoomReset | ToggleCamelHumps | ToggleMarkdown | MarkdownPreview | GotoHeading | ToggleSpellCheck | SpellingFix | NextTypo | PrevTypo | EditDictionary | RemoveDictWord | ToggleIndentation | ToggleLineEndings | ToggleColumnMode | Quit
                 | DiffWithSaved | DiffWithHead | DiffWithClipboard | DiffWithFile | DiffWithTab | DiffTreeSelection | ShowDiff | ShowHistory | PutLabel | CloseDiff
                 | NextDiff | PrevDiff
         )
@@ -189,6 +191,8 @@ impl Cmd {
             SpellingFix => "Spelling: Show Suggestions…",
             NextTypo => "Spelling: Next Problem",
             PrevTypo => "Spelling: Previous Problem",
+            EditDictionary => "Spelling: Edit Your Dictionary",
+            RemoveDictWord => "Spelling: Remove Word from Dictionary…",
             InsertLineBelow => "Edit: Insert Line After",
             InsertLineAbove => "Edit: Insert Line Before",
             GotoBracket => "Goto Matching Bracket",
@@ -206,7 +210,7 @@ impl Cmd {
             Undo, Redo, SelectAll, SelectLine, ExpandSelection, ShrinkSelection,
             SelectNextOccurrence, UnselectOccurrence, SelectAllOccurrences, SplitIntoLines,
             AddCaretAbove, AddCaretBelow, CaretsAtLineEnds, ToggleColumnMode, Duplicate, DeleteLine, MoveLineUp, MoveLineDown,
-            ToggleComment, Indent, Outdent, JoinLines, SortLines, ToggleCase, MdBold, MdItalic, ToggleMarkdown, MarkdownPreview, GotoHeading, ToggleSpellCheck, SpellingFix, NextTypo, PrevTypo, InsertLineBelow,
+            ToggleComment, Indent, Outdent, JoinLines, SortLines, ToggleCase, MdBold, MdItalic, ToggleMarkdown, MarkdownPreview, GotoHeading, ToggleSpellCheck, SpellingFix, NextTypo, PrevTypo, EditDictionary, RemoveDictWord, InsertLineBelow,
             InsertLineAbove, GotoBracket, NextTab, PrevTab, Quit,
             DiffWithSaved, DiffWithHead, DiffWithClipboard, DiffWithFile, DiffWithTab, DiffTreeSelection, ShowDiff, ShowHistory, PutLabel, CloseDiff,
             NextDiff, PrevDiff,
