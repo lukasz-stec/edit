@@ -3392,7 +3392,10 @@ impl eframe::App for App {
                                 if let Some(p) = &t.doc.path {
                                     r.on_hover_text(p.to_string_lossy());
                                 }
-                                let x = ui.add(egui::Label::new(RichText::new(if t.doc.is_dirty() { "●" } else { "×" }).color(text_col)).sense(Sense::click()).selectable(false));
+                                ui.add_space(8.0);
+                                let size = ui.style().text_styles.get(&egui::TextStyle::Body).map_or(14.0, |f| f.size);
+                                let (glyph, size) = if t.doc.is_dirty() { ("●", size) } else { ("×", size * 1.4) };
+                                let x = ui.add(egui::Label::new(RichText::new(glyph).size(size).color(text_col)).sense(Sense::click()).selectable(false));
                                 if x.clicked() {
                                     close = Some(i);
                                 }
