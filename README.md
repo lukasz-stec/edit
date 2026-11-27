@@ -21,6 +21,9 @@ A new release is published automatically for every push to `master`.
 | macOS (Apple Silicon and Intel) | `edit-macos-universal.zip` | Unzip and move `Edit.app` to Applications. The app isn't notarized, so open it the first time with right-click → **Open** |
 | Linux (x64) | `edit-linux-x64.tar.gz` | `tar xzf edit-linux-x64.tar.gz && ./edit` (needs GTK 3) |
 
+On macOS you can install and update with [Homebrew](https://brew.sh) instead:
+`brew install --cask lukasz-stec/edit/edit`, later `brew upgrade --cask edit`.
+
 Pass files or a folder on the command line: `edit path/to/project path/to/file.rs`.
 
 ## Features

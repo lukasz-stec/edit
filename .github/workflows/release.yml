@@ -132,3 +132,24 @@ jobs:
               --title "edit $TAG" --generate-notes
           fi
           gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+
+      # Point the Homebrew cask (github.com/lukasz-stec/homebrew-edit) at this release.
+      # HOMEBREW_TAP_KEY is the private half of a deploy key with write access to that repo;
+      # without it this step is skipped.
+      - name: Update Homebrew cask
+        env:
+          TAP_KEY: ${{ secrets.HOMEBREW_TAP_KEY }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          if [ -z "$TAP_KEY" ]; then echo "HOMEBREW_TAP_KEY not set, skipping"; exit 0; fi
+          sha=$(sha256sum dist/edit-macos-universal.zip | cut -d' ' -f1)
+          install -m 600 /dev/null ~/tap_key && printf '%s\n' "$TAP_KEY" > ~/tap_key
+          export GIT_SSH_COMMAND="ssh -i ~/tap_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          git clone -q git@github.com:lukasz-stec/homebrew-edit.git tap
+          cd tap
+          sed -i -E "s/^  version \".*\"/  version \"${TAG#v}\"/; s/^  sha256 \".*\"/  sha256 \"$sha\"/" Casks/edit.rb
+          git diff --quiet && exit 0
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -qam "edit ${TAG#v}"
+          git push -q
+          rm -f ~/tap_key
