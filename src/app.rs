@@ -3383,6 +3383,7 @@ impl eframe::App for App {
                         Frame::none().fill(fill).inner_margin(Margin::symmetric(12.0, 6.0)).show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 let r = ui.add(egui::Label::new(RichText::new(t.doc.name()).color(text_col)).sense(Sense::click()).selectable(false));
+                                let name_rect = r.rect;
                                 if r.clicked() {
                                     activate = Some(i);
                                 }
@@ -3393,9 +3394,23 @@ impl eframe::App for App {
                                     r.on_hover_text(p.to_string_lossy());
                                 }
                                 ui.add_space(8.0);
-                                let size = ui.style().text_styles.get(&egui::TextStyle::Body).map_or(14.0, |f| f.size);
-                                let (glyph, size) = if t.doc.is_dirty() { ("●", size) } else { ("×", size * 1.4) };
-                                let x = ui.add(egui::Label::new(RichText::new(glyph).size(size).color(text_col)).sense(Sense::click()).selectable(false));
+                                // drawn, not a glyph, so it sits exactly on the name's middle
+                                let h = name_rect.height();
+                                let (rect, x) = ui.allocate_exact_size(egui::vec2(h, h), Sense::click());
+                                let mid = egui::pos2(rect.center().x, name_rect.center().y);
+                                let col = if x.hovered() { c.fg } else { text_col };
+                                if x.hovered() {
+                                    ui.painter().rect_filled(egui::Rect::from_center_size(mid, egui::vec2(h, h)), 4.0, lerp(fill, c.fg, 0.22));
+                                    x.ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                if t.doc.is_dirty() && !x.hovered() {
+                                    ui.painter().circle_filled(mid, h * 0.2, col);
+                                } else {
+                                    let d = h * 0.22;
+                                    let stroke = egui::Stroke::new(1.5_f32, col);
+                                    ui.painter().line_segment([mid + egui::vec2(-d, -d), mid + egui::vec2(d, d)], stroke);
+                                    ui.painter().line_segment([mid + egui::vec2(-d, d), mid + egui::vec2(d, -d)], stroke);
+                                }
                                 if x.clicked() {
                                     close = Some(i);
                                 }
